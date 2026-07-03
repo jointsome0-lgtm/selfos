@@ -6,6 +6,10 @@ This is the integration level of selfos. The three subsystems are independent re
 - `../atlas` — knowledge-state graph (SDD stage, no code yet)
 - `../exp2res` — evidence-backed self-assessment (SDD stage, no code yet)
 
+## Shared agent skills
+
+Cross-repo Claude Code skills live in the sibling `agent-skills` repository (`../agent-skills`; GitHub: `jointsome0-lgtm/agent-skills`) — a Claude Code plugin marketplace. Install once at user scope: `/plugin marketplace add jointsome0-lgtm/agent-skills` (or the local checkout path), then `/plugin install sdd@agent-skills`. The `sdd` plugin ships `grill-sdd` (grill a spec section by section; outcomes land as SDD edits + issues). Repo-specific skills stay in each repo's `.claude/skills/`; if a needed skill is missing in a session, ask the user to install/update the plugin.
+
 ## Task routing
 
 - A task that concerns a single subsystem belongs in that subsystem's repository: work in its directory, follow its own `AGENTS.md`, file issues and PRs there.
