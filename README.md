@@ -10,4 +10,19 @@ Personal state platform: three independent local-first systems, one honest pictu
 
 This is the integration repository: the cross-system map, shared conventions, and — once the subsystems mature — pinned versions (git submodules) and orchestration to run everything together.
 
+## Integration model
+
+The subsystems stay mutually blind: none of them knows the others exist. Each defines only generic boundaries at its own edge (exports and source-agnostic imports); everything cross-system lives here, in the integration layer.
+
+```text
+tick-like JSONL ──adapter──► atlas    (knowledge domain: encounters, artifacts, plans)
+atlas state     ──adapter──► exp2res  (knowledge-state snapshot, ingested as evidence)
+tick-like JSONL ──adapter──► exp2res  (activity domain: diary, notes, focus/time)
+GitHub ─────────────────────► exp2res  (imported by exp2res itself)
+```
+
+Routing is by domain, not by source: knowledge flows through atlas; activity and words flow straight to exp2res. One event may split — a learning session's knowledge aspect goes to atlas, its time aspect to exp2res.
+
+The UI composes the same way: tick-like is the main shell, while the atlas viewer and exp2res views remain independent apps with their own design, embedded by URL from orchestrator config. Coupling is configuration, not code.
+
 Each subsystem is developed in its own repository with its own issues, PRs and agent guide.
