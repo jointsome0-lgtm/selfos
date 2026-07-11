@@ -6,6 +6,8 @@ This is the integration level of selfos. The three subsystems are independent re
 - `../atlas` — knowledge-state graph (SDD stage, no code yet)
 - `../exp2res` — evidence-backed self-assessment (SDD stage, no code yet)
 
+Shared infrastructure, also a sibling: `../tollgate` — LLM gateway + spend dashboard (Go + TS; learning lane, see its AGENTS.md; SDD stage, no code yet).
+
 ## Design intent
 
 Decided 2026-07-06. The primary goal is observation: a picture of what the user possibly knows, has studied, has done. Honesty is a quality requirement on that picture — it must stay derivable from recorded facts (hence evidence with per-source strength, state snapshots, no mastery scores) — not a separate driver above it.

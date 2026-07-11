@@ -8,6 +8,8 @@ Personal state platform: three independent local-first systems, one honest pictu
 | [atlas](https://github.com/jointsome0-lgtm/atlas) | What do I know? — graph-first knowledge-state system | SDD draft |
 | [exp2res](https://github.com/jointsome0-lgtm/exp2res) | What have I lived? — evidence-backed self-assessment | SDD draft |
 
+Shared infrastructure: [tollgate](https://github.com/jointsome0-lgtm/tollgate) — local LLM gateway (Go) with a TypeScript spend dashboard: one OpenAI-compatible endpoint metering token spend and routing across free daily quotas and cheap providers. Learning-lane repo (owner-built core); SDD draft.
+
 This is the integration repository: the cross-system map, shared conventions, and — once the subsystems mature — pinned versions (git submodules) and orchestration to run everything together.
 
 ## Integration model
