@@ -1,6 +1,10 @@
-@AGENTS.md
+# CLAUDE.md
 
-<!-- Single source of truth is AGENTS.md (shared with Codex and other tools). Add Claude-only rules below this line only if they cannot live in AGENTS.md. -->
+Read [AGENTS.md](AGENTS.md) first: it is the shared agent contract for this
+repository (the subsystem map, design intent, task routing, the integration
+model and its data boundaries, current stage, public-data policy) and applies
+to Claude Code in full. The public shape of the ecosystem lives in
+[README.md](README.md).
 
 ## Security reviews go to Codex
 
