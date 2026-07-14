@@ -135,8 +135,11 @@ def main() -> int:
         errors.append(f".gitignore missing required pattern: {pattern}")
 
     for path in sorted(candidates):
+        # Every component counts, the last one included: a gitlink or
+        # directory entry named like a denied root ("atlas") is denied
+        # too. A legitimate exception goes through the allowlist.
         parts = Path(path).parts
-        denied = bool(DENIED_DIR_NAMES.intersection(parts[:-1])) or matches_any(
+        denied = bool(DENIED_DIR_NAMES.intersection(parts)) or matches_any(
             parts[-1], DENIED_BASENAME_PATTERNS
         )
         if denied and path not in DENIED_PATH_ALLOWLIST:
