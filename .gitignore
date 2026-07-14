@@ -9,6 +9,7 @@ copies-manifest
 delivery-registry
 
 # Instance-shaped directories
+atlas/
 data/
 state/
 intake/

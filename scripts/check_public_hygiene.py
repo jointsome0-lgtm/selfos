@@ -18,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 REQUIRED_GITIGNORE_PATTERNS = {
+    "atlas/",
     "data/",
     "state/",
     "intake/",
@@ -40,6 +41,7 @@ REQUIRED_GITIGNORE_PATTERNS = {
 # slash-free directory semantics ("state/" matches nested state/).
 DENIED_DIR_NAMES = frozenset(
     {
+        "atlas",
         "data",
         "state",
         "intake",

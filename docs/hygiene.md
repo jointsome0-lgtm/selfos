@@ -29,7 +29,7 @@ the repository's `.gitignore` lacks any required protection. A
 repository extends this shared core with its own private-data paths:
 
 ```text
-data/  state/  intake/  graph/  plans/
+atlas/  data/  state/  intake/  graph/  plans/
 *.sqlite*  *.db*  *.jsonl
 .env  .env.*
 engine.pin  copies-manifest  delivery-registry
