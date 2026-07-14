@@ -1,8 +1,5 @@
 # Private data kinds
-*.sqlite
-*.sqlite3
-*.sqlite-shm
-*.sqlite-wal
+*.sqlite*
 *.db
 *.jsonl
 .env

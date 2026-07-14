@@ -23,10 +23,7 @@ REQUIRED_GITIGNORE_PATTERNS = {
     "intake/",
     "graph/",
     "plans/",
-    "*.sqlite",
-    "*.sqlite3",
-    "*.sqlite-shm",
-    "*.sqlite-wal",
+    "*.sqlite*",
     "*.db",
     "*.jsonl",
     ".env",
@@ -39,16 +36,25 @@ REQUIRED_GITIGNORE_PATTERNS = {
     ".agents/",
 }
 
-DENIED_PATH_PATTERNS = (
-    "data/**",
-    "state/**",
-    "intake/**",
-    "graph/**",
-    "plans/**",
-    "*.sqlite",
-    "*.sqlite3",
-    "*.sqlite-shm",
-    "*.sqlite-wal",
+# Directory names denied at any depth, matching gitignore's
+# slash-free directory semantics ("state/" matches nested state/).
+DENIED_DIR_NAMES = frozenset(
+    {
+        "data",
+        "state",
+        "intake",
+        "graph",
+        "plans",
+        ".claude",
+        ".codex",
+        ".agents",
+    }
+)
+
+# File patterns denied at any depth, matched against the basename —
+# "*.sqlite*" also covers -journal/-shm/-wal sidecars.
+DENIED_BASENAME_PATTERNS = (
+    "*.sqlite*",
     "*.db",
     "*.jsonl",
     ".env",
@@ -56,9 +62,6 @@ DENIED_PATH_PATTERNS = (
     "engine.pin",
     "copies-manifest",
     "delivery-registry",
-    ".claude/**",
-    ".codex/**",
-    ".agents/**",
 )
 
 FIXTURE_PATH_PATTERNS = ("fixtures/**",)
@@ -116,9 +119,11 @@ def main() -> int:
         errors.append(f".gitignore missing required pattern: {pattern}")
 
     for path in sorted(candidates):
-        if path not in DENIED_PATH_ALLOWLIST and matches_any(
-            path, DENIED_PATH_PATTERNS
-        ):
+        parts = Path(path).parts
+        denied = bool(DENIED_DIR_NAMES.intersection(parts[:-1])) or matches_any(
+            parts[-1], DENIED_BASENAME_PATTERNS
+        )
+        if denied and path not in DENIED_PATH_ALLOWLIST:
             errors.append(f"denied path visible to the public Git layer: {path}")
 
         if matches_any(path, FIXTURE_PATH_PATTERNS):
