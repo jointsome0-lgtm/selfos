@@ -1,6 +1,6 @@
 # Private data kinds
 *.sqlite*
-*.db
+*.db*
 *.jsonl
 .env
 .env.*

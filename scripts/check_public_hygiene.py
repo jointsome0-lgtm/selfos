@@ -24,7 +24,7 @@ REQUIRED_GITIGNORE_PATTERNS = {
     "graph/",
     "plans/",
     "*.sqlite*",
-    "*.db",
+    "*.db*",
     "*.jsonl",
     ".env",
     ".env.*",
@@ -55,7 +55,7 @@ DENIED_DIR_NAMES = frozenset(
 # "*.sqlite*" also covers -journal/-shm/-wal sidecars.
 DENIED_BASENAME_PATTERNS = (
     "*.sqlite*",
-    "*.db",
+    "*.db*",
     "*.jsonl",
     ".env",
     ".env.*",

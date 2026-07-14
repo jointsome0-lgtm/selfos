@@ -30,7 +30,7 @@ repository extends this shared core with its own private-data paths:
 
 ```text
 data/  state/  intake/  graph/  plans/
-*.sqlite*  *.db  *.jsonl
+*.sqlite*  *.db*  *.jsonl
 .env  .env.*
 engine.pin  copies-manifest  delivery-registry
 .claude/  .codex/  .agents/
