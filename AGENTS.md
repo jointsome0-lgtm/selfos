@@ -41,3 +41,5 @@ No submodules and no orchestration yet — atlas and exp2res are specs under act
 ## Public data boundary
 
 This repository is public. Same policy as ephemeris: never commit real personal data (ledger exports, notes, evidence files, screenshots with real entries), credentials, `.env`, or local agent/tool state. Invented demo data only.
+
+The ecosystem deletion contract — two tiers, the purge runbook, the honest residual-copy inventory — is [docs/deletion.md](docs/deletion.md); subsystem docs point at it and never restate it.
