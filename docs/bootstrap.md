@@ -97,27 +97,32 @@ that copy exists.
 
 ```text
 # copies-manifest — one line per durable copy; making a copy = registering it
-name        kind           location                                   created     last-verified
-vera-atlas  working-clone  /home/vera/atlas-instance                  2026-07-14  —
-# vera-nas  bare-remote    vera@nas.example.com:/home/vera/atlas.git  2026-07-14  —
+name        kind           location                                   created     last-verified  purged-through
+vera-atlas  working-clone  /home/vera/atlas-instance                  2026-07-14  —              —
+# vera-nas  bare-remote    vera@nas.example.com:/home/vera/atlas.git  2026-07-14  —              —
 ```
 
 `name` identifies the copy. `kind` is `working-clone`, `bare-remote`,
 `borg-repo`, `age-bundle`, or `other`. `location` identifies where the
 copy lives; `created` is its creation date; `last-verified` is a date
-or `—`.
+or `—`. `purged-through` is the purge generation this copy has been
+brought up to — `—` until the first purge; its mechanics are the
+[deletion contract](deletion.md)'s.
 
 Copy this block verbatim into `delivery-registry` at the instance root.
 The example stays commented until that delivery exists.
 
 ```text
 # delivery-registry — one line per export delivery; making a delivery = registering it
-date        destination
-# 2026-07-14  /home/vera/exp2res-workspace/intake/atlas-snapshot.json
+id                  destination                                              superseded-by
+# d-2026-07-14-001  /home/vera/exp2res-workspace/intake/atlas-snapshot.json  —
 ```
 
-The registry columns are the delivery date and destination. Add a line
-when an export is delivered, not later.
+`id` is date-serial (`d-<date>-<NNN>`), so two same-day deliveries
+stay distinct; `superseded-by` is `—` until a purge walk revokes and
+re-exports the delivery ([deletion contract](deletion.md)). A
+destination expected to receive classed exports takes a neutral
+operational label. Add a line when an export is delivered, not later.
 
 ## 6. Configure path discovery
 
