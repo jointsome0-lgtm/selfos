@@ -1,0 +1,10 @@
+# Install with `pre-commit install`; CI runs the same script as backstop.
+repos:
+  - repo: local
+    hooks:
+      - id: public-hygiene
+        name: public hygiene
+        entry: python scripts/check_public_hygiene.py
+        language: system
+        pass_filenames: false
+        always_run: true
