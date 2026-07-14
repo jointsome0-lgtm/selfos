@@ -73,17 +73,30 @@ DENIED_PATH_ALLOWLIST: frozenset[str] = frozenset(
 )
 
 
-def candidate_git_files() -> list[str]:
-    """Return tracked and untracked-unignored repository paths."""
-    raw = subprocess.check_output(
-        ("git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"),
-        cwd=ROOT,
-    )
-    return [
+def git_paths(*args: str) -> set[str]:
+    raw = subprocess.check_output(("git", "ls-files", "-z", *args), cwd=ROOT)
+    return {
         path.decode("utf-8", errors="surrogateescape")
         for path in raw.split(b"\0")
         if path
-    ]
+    }
+
+
+def candidate_git_files() -> tuple[set[str], set[str]]:
+    """Return (cached, untracked-unignored) repository paths."""
+    return git_paths("--cached"), git_paths("--others", "--exclude-standard")
+
+
+def fixture_content(path: str, cached: set[str]) -> bytes:
+    """Read what the public Git layer would publish for this path.
+
+    For a cached path that is the staged blob, not the working tree —
+    an unstaged edit adding the marker must not mask an unmarked
+    staged fixture in the pre-commit gate.
+    """
+    if path in cached:
+        return subprocess.check_output(("git", "show", f":{path}"), cwd=ROOT)
+    return (ROOT / path).read_bytes()
 
 
 def matches_any(path: str, patterns: tuple[str, ...]) -> bool:
@@ -102,7 +115,8 @@ def main() -> int:
     errors: list[str] = []
 
     try:
-        candidates = candidate_git_files()
+        cached, untracked = candidate_git_files()
+        candidates = cached | untracked
     except (OSError, subprocess.CalledProcessError) as exc:
         detail = str(exc).replace("\n", " ")
         print(f"FAIL: cannot inspect the public Git layer: {detail}", file=sys.stderr)
@@ -128,8 +142,8 @@ def main() -> int:
 
         if matches_any(path, FIXTURE_PATH_PATTERNS):
             try:
-                fixture = (ROOT / path).read_bytes()
-            except OSError as exc:
+                fixture = fixture_content(path, cached)
+            except (OSError, subprocess.CalledProcessError) as exc:
                 detail = str(exc).replace("\n", " ")
                 errors.append(f"cannot read fixture {path}: {detail}")
             else:
