@@ -89,12 +89,12 @@ def candidate_git_files() -> tuple[set[str], set[str]]:
     return git_paths("--cached"), git_paths("--others", "--exclude-standard")
 
 
-def fixture_content(path: str, cached: set[str]) -> bytes:
+def published_content(path: str, cached: set[str]) -> bytes:
     """Read what the public Git layer would publish for this path.
 
     For a cached path that is the staged blob, not the working tree —
-    an unstaged edit adding the marker must not mask an unmarked
-    staged fixture in the pre-commit gate.
+    an unstaged edit must not mask what a commit would publish (an
+    unmarked staged fixture, a staged .gitignore losing a pattern).
     """
     if path in cached:
         return subprocess.check_output(("git", "show", f":{path}"), cwd=ROOT)
@@ -105,10 +105,11 @@ def matches_any(path: str, patterns: tuple[str, ...]) -> bool:
     return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
 
 
-def active_gitignore_patterns() -> set[str]:
+def active_gitignore_patterns(cached: set[str]) -> set[str]:
+    text = published_content(".gitignore", cached).decode("utf-8")
     return {
         line.strip()
-        for line in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+        for line in text.splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     }
 
@@ -125,8 +126,8 @@ def main() -> int:
         return 1
 
     try:
-        gitignore_patterns = active_gitignore_patterns()
-    except OSError as exc:
+        gitignore_patterns = active_gitignore_patterns(cached)
+    except (OSError, subprocess.CalledProcessError) as exc:
         detail = str(exc).replace("\n", " ")
         print(f"FAIL: cannot read .gitignore: {detail}", file=sys.stderr)
         return 1
@@ -147,7 +148,7 @@ def main() -> int:
 
         if matches_any(path, FIXTURE_PATH_PATTERNS):
             try:
-                fixture = fixture_content(path, cached)
+                fixture = published_content(path, cached)
             except (OSError, subprocess.CalledProcessError) as exc:
                 detail = str(exc).replace("\n", " ")
                 errors.append(f"cannot read fixture {path}: {detail}")
