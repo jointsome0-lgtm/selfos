@@ -82,8 +82,9 @@ The **copies manifest** lists every durable remote, clone, and backup
 medium. The **export delivery registry** records one line per snapshot
 delivery. Both are instance-side tracked files and ride inside the
 unit being copied, so every copy knows all registered copies. Their
-templates will ship with the forthcoming
-[docs/bootstrap.md](bootstrap.md) walkthrough.
+templates ship with the bootstrap walkthrough
+([selfos#17](https://github.com/jointsome0-lgtm/selfos/issues/17));
+once it lands, `docs/bootstrap.md` is the page.
 
 **ephemeris.** Its SQLite ledger, backups, and exports live in a
 private data root outside the public checkout. `ACTIVITY_DATA_DIR`
