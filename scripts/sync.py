@@ -1,0 +1,275 @@
+"""Synchronize sibling public-engine repositories to the pinned revisions.
+
+The policy is decided in issue #1. Sibling checkouts are resolved relative to
+this repository, never cloned or fetched, and a dirty checkout is never
+changed. ``--status`` is fully read-only; normal mode performs only the
+explicit ``git checkout <sha>`` needed to reach a locally available pin.
+Requires Python 3.11+ (tomllib).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PINS_PATH = ROOT / "pins.toml"
+EXPECTED_REPOS = ("ephemeris", "atlas", "exp2res")
+FULL_SHA = re.compile(r"[0-9a-fA-F]{40}")
+
+
+class ManifestError(ValueError):
+    """The pins manifest is missing or does not match its strict contract."""
+
+
+class GitInspectionError(RuntimeError):
+    """A local Git repository could not be inspected reliably."""
+
+
+def load_pins(path: Path = PINS_PATH) -> dict[str, str]:
+    """Load exactly one full commit SHA for each expected sibling."""
+    try:
+        with path.open("rb") as manifest:
+            data = tomllib.load(manifest)
+    except FileNotFoundError as exc:
+        raise ManifestError("pins.toml is missing") from exc
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ManifestError(f"cannot read pins.toml: {exc}") from exc
+
+    keys = set(data)
+    expected = set(EXPECTED_REPOS)
+    if keys != expected:
+        parts = []
+        if missing := sorted(expected - keys):
+            parts.append(f"missing keys: {', '.join(missing)}")
+        if unexpected := sorted(keys - expected):
+            parts.append(f"unknown keys: {', '.join(unexpected)}")
+        raise ManifestError("invalid pins.toml (" + "; ".join(parts) + ")")
+
+    pins: dict[str, str] = {}
+    for name in EXPECTED_REPOS:
+        value = data[name]
+        if not isinstance(value, str) or FULL_SHA.fullmatch(value) is None:
+            raise ManifestError(
+                f"invalid pins.toml ({name} must be a full 40-character SHA)"
+            )
+        pins[name] = value.lower()
+    return pins
+
+
+def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run a local-only Git inspection with optional index writes disabled."""
+    env = os.environ.copy()
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return subprocess.run(
+        ("git", "-C", str(repo), *args),
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+
+
+def is_git_repo(path: Path) -> bool:
+    """Return whether path is the root of a working-tree Git repository."""
+    if not path.is_dir():
+        return False
+    result = run_git(path, "rev-parse", "--show-toplevel")
+    if result.returncode != 0:
+        return False
+    return Path(result.stdout.strip()).resolve() == path.resolve()
+
+
+def git_output(repo: Path, *args: str) -> str:
+    """Return stripped stdout or raise a concise inspection error."""
+    result = run_git(repo, *args)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "Git command failed"
+        raise GitInspectionError(detail.replace("\n", " "))
+    return result.stdout.strip()
+
+
+def head_sha(repo: Path) -> str:
+    """Return the full commit SHA at HEAD."""
+    return git_output(repo, "rev-parse", "--verify", "HEAD^{commit}")
+
+
+def worktree_is_dirty(repo: Path) -> bool:
+    """Include staged, unstaged, and untracked paths in the dirty check."""
+    return bool(git_output(repo, "status", "--porcelain"))
+
+
+def pin_is_available(repo: Path, pin: str) -> bool:
+    """Return whether pin resolves to a commit in the local object store."""
+    return run_git(repo, "cat-file", "-e", f"{pin}^{{commit}}").returncode == 0
+
+
+def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    """Test commit ancestry, distinguishing false from an inspection error."""
+    result = run_git(repo, "merge-base", "--is-ancestor", ancestor, descendant)
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    detail = result.stderr.strip() or "git merge-base failed"
+    raise GitInspectionError(detail.replace("\n", " "))
+
+
+def revision_state(repo: Path, head: str, pin: str) -> str:
+    """Classify HEAD relative to a locally available pin."""
+    if head == pin:
+        return "match"
+    if is_ancestor(repo, pin, head):
+        return "ahead"
+    if is_ancestor(repo, head, pin):
+        return "behind"
+    return "diverged"
+
+
+def abbreviated(sha: str) -> str:
+    """Use the repository-wide diagnostic SHA convention."""
+    return sha[:12]
+
+
+def report_status(pins: dict[str, str]) -> int:
+    """Report pin and cleanliness state without changing any checkout."""
+    all_match = True
+    for name in EXPECTED_REPOS:
+        repo = ROOT.parent / name
+        pin = pins[name]
+        if not is_git_repo(repo):
+            print(f"{name}: absent")
+            all_match = False
+            continue
+
+        try:
+            head = head_sha(repo)
+            dirty = worktree_is_dirty(repo)
+        except GitInspectionError as exc:
+            print(f"{name}: absent ({exc})")
+            all_match = False
+            continue
+
+        marker = " dirty" if dirty else ""
+        if not pin_is_available(repo, pin):
+            print(
+                f"{name}: unknown-pin head={abbreviated(head)} "
+                f"pin={abbreviated(pin)}{marker}"
+            )
+            all_match = False
+            continue
+
+        try:
+            state = revision_state(repo, head, pin)
+        except GitInspectionError as exc:
+            print(f"{name}: diverged ({exc}){marker}")
+            all_match = False
+            continue
+
+        print(
+            f"{name}: {state} head={abbreviated(head)} "
+            f"pin={abbreviated(pin)}{marker}"
+        )
+        if state != "match" or dirty:
+            all_match = False
+    return 0 if all_match else 1
+
+
+def synchronize(pins: dict[str, str]) -> int:
+    """Checkout each locally available pin, refusing every unsafe case."""
+    all_synced = True
+    for name in EXPECTED_REPOS:
+        repo = ROOT.parent / name
+        pin = pins[name]
+        if not is_git_repo(repo):
+            print(f"{name}: error: sibling is absent or not a Git repository")
+            all_synced = False
+            continue
+
+        try:
+            if worktree_is_dirty(repo):
+                print(f"{name}: refused: working tree is dirty")
+                all_synced = False
+                continue
+            head = head_sha(repo)
+        except GitInspectionError as exc:
+            print(f"{name}: error: cannot inspect repository: {exc}")
+            all_synced = False
+            continue
+
+        if not pin_is_available(repo, pin):
+            print(
+                f"{name}: error: pin {abbreviated(pin)} is not available "
+                f"locally; run git fetch manually in {name}"
+            )
+            all_synced = False
+            continue
+
+        if head == pin:
+            print(f"{name}: already at pin {abbreviated(pin)}")
+            continue
+
+        result = run_git(repo, "checkout", pin)
+        if result.returncode != 0:
+            detail = result.stderr.strip() or "git checkout failed"
+            print(f"{name}: error: {detail.replace(chr(10), ' ')}")
+            all_synced = False
+            continue
+
+        try:
+            final_head = head_sha(repo)
+            final_dirty = worktree_is_dirty(repo)
+        except GitInspectionError as exc:
+            print(f"{name}: error: cannot verify checkout: {exc}")
+            all_synced = False
+            continue
+        if final_head != pin or final_dirty:
+            detail = (
+                "working tree became dirty" if final_dirty else "HEAD missed the pin"
+            )
+            print(f"{name}: error: checkout verification failed: {detail}")
+            all_synced = False
+            continue
+        print(f"{name}: checked out pin {abbreviated(pin)}")
+
+    return 0 if all_synced else 1
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Synchronize sibling repositories to pins.toml."
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="report revision drift and cleanliness without changing anything",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        pins = load_pins()
+    except ManifestError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        if args.status:
+            return report_status(pins)
+        return synchronize(pins)
+    except OSError as exc:
+        print(f"error: cannot run local Git command: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
