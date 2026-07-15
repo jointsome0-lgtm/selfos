@@ -1,0 +1,27 @@
+# Private data kinds
+*.sqlite*
+*.db*
+*.jsonl
+.env
+.env.*
+engine.pin
+copies-manifest
+delivery-registry
+
+# Instance-shaped directories
+atlas/
+data/
+state/
+intake/
+graph/
+plans/
+
+# Local agent and tool state
+.claude/
+.codex/
+.agents/
+
+# OS and editor noise
+.DS_Store
+*.swp
+__pycache__/
