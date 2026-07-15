@@ -36,7 +36,7 @@ Decided 2026-07-05. The README states the public shape; the working rules for ag
 
 ## Current stage
 
-No submodules and no orchestration yet — atlas and exp2res are specs under active refinement. When they gain code, this repo will pin subsystem versions via git submodules, provide the run-everything entry point, and grow the adapters described above.
+No orchestration yet — atlas is a spec under active refinement; exp2res is entering implementation. Subsystem versions are pinned via a version manifest + bootstrap script (decided 2026-07-15, #1): a pins file mapping repo → SHA plus a sync/status command operating on the sibling checkouts — never git submodules (they would duplicate the sibling layout). Package-level pinning (`uv.lock` over git tags) is the declared endpoint once subsystems are installable; the manifest then either folds into it or stays as the dev-checkout pin. Orchestration (run-everything) waits until at least two subsystems are genuinely runnable; `selfos doctor` is tracked in #7.
 
 ## Public data boundary
 
