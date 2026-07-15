@@ -105,13 +105,30 @@ def matches_any(path: str, patterns: tuple[str, ...]) -> bool:
     return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
 
 
-def active_gitignore_patterns(cached: set[str]) -> set[str]:
+def check_gitignore(cached: set[str]) -> list[str]:
+    """Validate the published .gitignore against the required patterns.
+
+    Lines are taken verbatim (rstrip only): git treats a leading space
+    literally, so an indented " data/" must not count as "data/". A
+    negation re-including a required pattern is an error too.
+    """
+    if ".gitignore" not in cached:
+        return [".gitignore must be tracked in the index"]
+
     text = published_content(".gitignore", cached).decode("utf-8")
-    return {
-        line.strip()
-        for line in text.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    }
+    lines = [line.rstrip() for line in text.splitlines()]
+    patterns = {line for line in lines if line and not line.startswith("#")}
+
+    errors = [
+        f".gitignore missing required pattern: {pattern}"
+        for pattern in sorted(REQUIRED_GITIGNORE_PATTERNS - patterns)
+    ]
+    errors.extend(
+        f".gitignore negates required pattern: {line}"
+        for line in lines
+        if line.startswith("!") and line[1:] in REQUIRED_GITIGNORE_PATTERNS
+    )
+    return errors
 
 
 def main() -> int:
@@ -126,14 +143,11 @@ def main() -> int:
         return 1
 
     try:
-        gitignore_patterns = active_gitignore_patterns(cached)
+        errors.extend(check_gitignore(cached))
     except (OSError, subprocess.CalledProcessError) as exc:
         detail = str(exc).replace("\n", " ")
         print(f"FAIL: cannot read .gitignore: {detail}", file=sys.stderr)
         return 1
-
-    for pattern in sorted(REQUIRED_GITIGNORE_PATTERNS - gitignore_patterns):
-        errors.append(f".gitignore missing required pattern: {pattern}")
 
     for path in sorted(candidates):
         # Every component counts, the last one included: a gitlink or
