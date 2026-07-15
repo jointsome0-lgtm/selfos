@@ -36,7 +36,7 @@ Decided 2026-07-05. The README states the public shape; the working rules for ag
 
 ## Current stage
 
-The canonical per-repository states, allowed implementation frontiers, issue gates, friction rules, and transition triggers live in [docs/readiness.md](docs/readiness.md). Read that matrix before slicing or implementing work.
+The canonical per-repository states, allowed implementation frontiers, issue gates, friction rules, and transition triggers live in [docs/readiness.md](docs/readiness.md). Read that matrix before slicing or implementing work. Day-to-day scripts (pin sync, doctor, tracker backup) are indexed in [docs/ops.md](docs/ops.md).
 
 ## Public data boundary
 
