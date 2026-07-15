@@ -138,7 +138,7 @@ def clobber_candidates(repo: Path, pin: str) -> list[str]:
     different files merely sharing a directory do not collide.
     """
     tracked_in_pin = set(
-        git_output(repo, "ls-tree", "-r", "--name-only", pin).splitlines()
+        git_output(repo, "ls-tree", "-r", "--name-only", f"{pin}^{{commit}}").splitlines()
     )
     tracked_ancestors = set().union(
         *(path_ancestors(path) for path in tracked_in_pin), set()
@@ -281,7 +281,17 @@ def synchronize(pins: dict[str, str]) -> int:
         # An empty hooks path keeps a local post-checkout hook from
         # running arbitrary code mid-sync (fetching, dirtying the tree,
         # or turning a completed checkout into a reported failure).
-        result = run_git(repo, "-c", f"core.hooksPath={os.devnull}", "checkout", pin)
+        # --detach plus the ^{commit} rev form pins the checkout to the
+        # object itself: a stray branch named like the 40-hex SHA would
+        # otherwise win the single-argument <branch> resolution.
+        result = run_git(
+            repo,
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            "checkout",
+            "--detach",
+            f"{pin}^{{commit}}",
+        )
         if result.returncode != 0:
             detail = result.stderr.strip() or "git checkout failed"
             print(f"{name}: error: {detail.replace(chr(10), ' ')}")
