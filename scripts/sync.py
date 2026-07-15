@@ -111,6 +111,20 @@ def pin_is_available(repo: Path, pin: str) -> bool:
     return run_git(repo, "cat-file", "-e", f"{pin}^{{commit}}").returncode == 0
 
 
+def clobber_candidates(repo: Path, pin: str) -> list[str]:
+    """Return local untracked files (ignored included) that the pin tracks.
+
+    ``git status --porcelain`` omits ignored files, and ``git checkout``
+    silently overwrites an ignored file when the target commit tracks the
+    same path — so this must be checked separately before any checkout.
+    """
+    tracked_in_pin = set(
+        git_output(repo, "ls-tree", "-r", "--name-only", pin).splitlines()
+    )
+    present_untracked = set(git_output(repo, "ls-files", "--others").splitlines())
+    return sorted(tracked_in_pin & present_untracked)
+
+
 def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     """Test commit ancestry, distinguishing false from an inspection error."""
     result = run_git(repo, "merge-base", "--is-ancestor", ancestor, descendant)
@@ -214,6 +228,20 @@ def synchronize(pins: dict[str, str]) -> int:
 
         if head == pin:
             print(f"{name}: already at pin {abbreviated(pin)}")
+            continue
+
+        try:
+            clobbered = clobber_candidates(repo, pin)
+        except GitInspectionError as exc:
+            print(f"{name}: error: cannot inspect repository: {exc}")
+            all_synced = False
+            continue
+        if clobbered:
+            print(
+                f"{name}: refused: checkout would overwrite "
+                f"{len(clobbered)} ignored local file(s) tracked at the pin"
+            )
+            all_synced = False
             continue
 
         result = run_git(repo, "checkout", pin)
