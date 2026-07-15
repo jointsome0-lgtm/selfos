@@ -134,7 +134,13 @@ def clobber_candidates(repo: Path, pin: str) -> list[str]:
     tracked_ancestors = set().union(
         *(path_ancestors(path) for path in tracked_in_pin), set()
     )
-    present_untracked = git_output(repo, "ls-files", "--others").splitlines()
+    # A nested repository is listed as a bare directory marker
+    # ("subrepo/", no recursion); strip the slash so prefix comparison
+    # still collides it with the pin's "subrepo/..." entries.
+    present_untracked = [
+        line.rstrip("/")
+        for line in git_output(repo, "ls-files", "--others").splitlines()
+    ]
     return sorted(
         path
         for path in present_untracked
