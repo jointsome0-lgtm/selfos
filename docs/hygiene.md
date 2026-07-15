@@ -16,6 +16,10 @@ pre-commit hook and a CI job. Both layers are required, not
 alternatives. CI is the backstop when the hook is bypassed or not
 installed.
 
+The hook mechanism (decided 2026-07-15) is a committed
+`.githooks/pre-commit` script that runs the checker, enabled once per
+clone with `git config core.hooksPath .githooks`. No hook framework.
+
 ## Denied paths
 
 The ownership table in [Private instance](instance.md) defines the
