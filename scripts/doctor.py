@@ -146,9 +146,15 @@ def git_output(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def pin_is_available(repo: Path, pin: str) -> bool:
-    """Return whether pin resolves to a commit in the local object store."""
-    return run_git(repo, "cat-file", "-e", f"{pin}^{{commit}}").returncode == 0
+def pin_object_type(repo: Path, pin: str) -> str | None:
+    """Return the pin's local object type, or None when it is absent.
+
+    The type must be checked, not just ``^{commit}`` resolvability: an
+    annotated tag's own SHA peels to a commit, so a tag pin would pass
+    a mere existence check while sync could never verify it as HEAD.
+    """
+    result = run_git(repo, "cat-file", "-t", pin)
+    return result.stdout.strip() if result.returncode == 0 else None
 
 
 def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
@@ -234,7 +240,7 @@ def repo_checks(
                 "Restore a valid pins.toml and run doctor again.",
             )
         )
-    elif not pin_is_available(repo, pin):
+    elif (pin_type := pin_object_type(repo, pin)) is None:
         checks.append(
             Check(
                 "repo.revision_matches_pin",
@@ -243,6 +249,18 @@ def repo_checks(
                 f"pin {abbreviated(pin)} is unknown in the local object store; "
                 f"HEAD is {abbreviated(head)}",
                 f"Run git fetch manually in {label}, then run doctor again.",
+            )
+        )
+    elif pin_type != "commit":
+        checks.append(
+            Check(
+                "repo.revision_matches_pin",
+                label,
+                "warning",
+                f"pin {abbreviated(pin)} names a {pin_type} object, "
+                "not a commit",
+                "Re-pin to the commit SHA in pins.toml; sync refuses "
+                "non-commit pins.",
             )
         )
     else:

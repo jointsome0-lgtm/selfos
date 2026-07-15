@@ -139,9 +139,15 @@ def worktree_is_dirty(repo: Path) -> bool:
     return bool(git_output(repo, "status", "--porcelain", "--untracked-files=all"))
 
 
-def pin_is_available(repo: Path, pin: str) -> bool:
-    """Return whether pin resolves to a commit in the local object store."""
-    return run_git(repo, "cat-file", "-e", f"{pin}^{{commit}}").returncode == 0
+def pin_object_type(repo: Path, pin: str) -> str | None:
+    """Return the pin's local object type, or None when it is absent.
+
+    The type must be checked, not just ``^{commit}`` resolvability: an
+    annotated tag's own SHA peels to a commit, and a checkout of the
+    peeled commit would move the tree before verification could fail.
+    """
+    result = run_git(repo, "cat-file", "-t", pin)
+    return result.stdout.strip() if result.returncode == 0 else None
 
 
 def path_ancestors(path: str) -> set[str]:
@@ -230,9 +236,17 @@ def report_status(pins: dict[str, str]) -> int:
             continue
 
         marker = " dirty" if dirty else ""
-        if not pin_is_available(repo, pin):
+        pin_type = pin_object_type(repo, pin)
+        if pin_type is None:
             print(
                 f"{name}: unknown-pin head={abbreviated(head)} "
+                f"pin={abbreviated(pin)}{marker}"
+            )
+            all_match = False
+            continue
+        if pin_type != "commit":
+            print(
+                f"{name}: bad-pin ({pin_type} object, not a commit) "
                 f"pin={abbreviated(pin)}{marker}"
             )
             all_match = False
@@ -276,10 +290,18 @@ def synchronize(pins: dict[str, str]) -> int:
             all_synced = False
             continue
 
-        if not pin_is_available(repo, pin):
+        pin_type = pin_object_type(repo, pin)
+        if pin_type is None:
             print(
                 f"{name}: error: pin {abbreviated(pin)} is not available "
                 f"locally; run git fetch manually in {name}"
+            )
+            all_synced = False
+            continue
+        if pin_type != "commit":
+            print(
+                f"{name}: error: pin {abbreviated(pin)} is a {pin_type} "
+                f"object, not a commit; re-pin to the commit SHA"
             )
             all_synced = False
             continue
