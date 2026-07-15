@@ -64,9 +64,14 @@ def load_pins(path: Path = PINS_PATH) -> dict[str, str]:
 
 
 def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    """Run a local-only Git inspection with optional index writes disabled."""
+    """Run a local-only Git command: no optional locks, no lazy fetches.
+
+    GIT_NO_LAZY_FETCH keeps a partial/promisor clone from fetching
+    missing objects on demand, which would violate the offline contract.
+    """
     env = os.environ.copy()
     env["GIT_OPTIONAL_LOCKS"] = "0"
+    env["GIT_NO_LAZY_FETCH"] = "1"
     return subprocess.run(
         ("git", "-C", str(repo), *args),
         check=False,
