@@ -26,8 +26,8 @@ future fixture.
 - **Email:** `vera@example.com`; `example.com` is the RFC 2606 example
   domain.
 - **Occupation:** technical writer.
-- **Learning interests:** Kubernetes operations, human anatomy, and
-  strength-training basics.
+- **Learning interests:** Kubernetes operations, human anatomy,
+  strength-training basics, and backend distributed systems in Python.
 - **Tone:** mundane and small; this is demo data, not fiction writing.
 
 ## One identity
