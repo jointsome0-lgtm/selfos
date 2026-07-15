@@ -301,23 +301,40 @@ def discover_instance(
     label: str,
     config_instances: dict[str, str],
 ) -> tuple[Path | None, str]:
-    """Apply doctor's environment-then-config discovery precedence."""
+    """Apply doctor's environment-then-config discovery precedence.
+
+    The returned path is absolute but deliberately unresolved: the
+    containment check must also see the path as configured, not only
+    its symlink target.
+    """
     env_var = ENV_VARS[label]
     if value := os.environ.get(env_var):
-        return Path(value).expanduser().resolve(), f"environment variable {env_var}"
+        return Path(os.path.abspath(Path(value).expanduser())), (
+            f"environment variable {env_var}"
+        )
     if value := config_instances.get(label):
-        return Path(value).expanduser().resolve(), f"user config instances.{label}"
+        return Path(os.path.abspath(Path(value).expanduser())), (
+            f"user config instances.{label}"
+        )
     return None, ""
 
 
 def containing_public_root(root: Path) -> str | None:
-    """Return the logical public checkout containing root, if any."""
+    """Return the logical public checkout containing root, if any.
+
+    Both the path as configured and its fully resolved target are
+    tested: a symlink living inside a public checkout is refused even
+    when it points outside (a public-checkout alias to private data),
+    and a symlink living outside is refused when its target is inside.
+    """
     public_roots = {"selfos": ROOT}
     public_roots.update({name: ROOT.parent / name for name in EXPECTED_REPOS})
-    resolved = root.resolve()
+    candidates = {root, root.resolve()}
     for label, public_root in public_roots.items():
-        if resolved.is_relative_to(public_root.resolve()):
-            return label
+        resolved_public = public_root.resolve()
+        for candidate in candidates:
+            if candidate.is_relative_to(resolved_public):
+                return label
     return None
 
 

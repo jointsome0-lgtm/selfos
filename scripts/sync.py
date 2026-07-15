@@ -278,7 +278,10 @@ def synchronize(pins: dict[str, str]) -> int:
             all_synced = False
             continue
 
-        result = run_git(repo, "checkout", pin)
+        # An empty hooks path keeps a local post-checkout hook from
+        # running arbitrary code mid-sync (fetching, dirtying the tree,
+        # or turning a completed checkout into a reported failure).
+        result = run_git(repo, "-c", f"core.hooksPath={os.devnull}", "checkout", pin)
         if result.returncode != 0:
             detail = result.stderr.strip() or "git checkout failed"
             print(f"{name}: error: {detail.replace(chr(10), ' ')}")
