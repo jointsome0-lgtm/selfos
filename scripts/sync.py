@@ -10,6 +10,7 @@ Requires Python 3.11+ (tomllib).
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import re
 import subprocess
@@ -63,15 +64,38 @@ def load_pins(path: Path = PINS_PATH) -> dict[str, str]:
     return pins
 
 
-def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    """Run a local-only Git command: no optional locks, no lazy fetches.
+@functools.cache
+def git_env() -> dict[str, str]:
+    """Build a caller-independent environment for Git in a sibling repo.
 
-    GIT_NO_LAZY_FETCH keeps a partial/promisor clone from fetching
-    missing objects on demand, which would violate the offline contract.
+    Repo-local variables (GIT_DIR, GIT_WORK_TREE, ...) exported by a
+    caller such as a Git hook would override ``git -C`` and point the
+    command at the wrong repository, so everything git itself lists as
+    local is removed. GIT_NO_LAZY_FETCH keeps a partial/promisor clone
+    from fetching missing objects on demand; GIT_NO_REPLACE_OBJECTS
+    keeps refs/replace/* from silently substituting the pinned commit.
     """
     env = os.environ.copy()
+    listed = subprocess.run(
+        ("git", "rev-parse", "--local-env-vars"),
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    ).stdout.split()
+    fallback = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+                "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES")
+    for var in (*listed, *fallback):
+        env.pop(var, None)
     env["GIT_OPTIONAL_LOCKS"] = "0"
     env["GIT_NO_LAZY_FETCH"] = "1"
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return env
+
+
+def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run a local-only Git command in a caller-independent environment."""
+    env = git_env()
     return subprocess.run(
         ("git", "-C", str(repo), *args),
         check=False,
