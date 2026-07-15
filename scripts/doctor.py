@@ -244,7 +244,9 @@ def repo_checks(
                 )
             )
 
-    dirty = bool(git_output(repo, "status", "--porcelain"))
+    # --untracked-files=all overrides a status.showUntrackedFiles=no
+    # repository config, which would otherwise hide untracked files.
+    dirty = bool(git_output(repo, "status", "--porcelain", "--untracked-files=all"))
     if dirty:
         checks.append(
             Check(

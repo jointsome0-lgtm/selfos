@@ -107,8 +107,12 @@ def head_sha(repo: Path) -> str:
 
 
 def worktree_is_dirty(repo: Path) -> bool:
-    """Include staged, unstaged, and untracked paths in the dirty check."""
-    return bool(git_output(repo, "status", "--porcelain"))
+    """Include staged, unstaged, and untracked paths in the dirty check.
+
+    --untracked-files=all overrides a status.showUntrackedFiles=no
+    repository config, which would otherwise hide untracked files.
+    """
+    return bool(git_output(repo, "status", "--porcelain", "--untracked-files=all"))
 
 
 def pin_is_available(repo: Path, pin: str) -> bool:
