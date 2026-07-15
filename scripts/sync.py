@@ -111,18 +111,37 @@ def pin_is_available(repo: Path, pin: str) -> bool:
     return run_git(repo, "cat-file", "-e", f"{pin}^{{commit}}").returncode == 0
 
 
+def path_ancestors(path: str) -> set[str]:
+    """Return every proper directory prefix of a slash-separated path."""
+    parts = path.split("/")
+    return {"/".join(parts[:i]) for i in range(1, len(parts))}
+
+
 def clobber_candidates(repo: Path, pin: str) -> list[str]:
-    """Return local untracked files (ignored included) that the pin tracks.
+    """Return local untracked files (ignored included) the checkout may hit.
 
     ``git status --porcelain`` omits ignored files, and ``git checkout``
-    silently overwrites an ignored file when the target commit tracks the
+    overwrites ignored files by default when the target commit tracks the
     same path — so this must be checked separately before any checkout.
+    Comparison is prefix-aware in both directions: a pin entry ``data``
+    collides with a local ignored ``data/secret``, and a pin entry
+    ``data/secret`` collides with a local ignored file ``data``. Two
+    different files merely sharing a directory do not collide.
     """
     tracked_in_pin = set(
         git_output(repo, "ls-tree", "-r", "--name-only", pin).splitlines()
     )
-    present_untracked = set(git_output(repo, "ls-files", "--others").splitlines())
-    return sorted(tracked_in_pin & present_untracked)
+    tracked_ancestors = set().union(
+        *(path_ancestors(path) for path in tracked_in_pin), set()
+    )
+    present_untracked = git_output(repo, "ls-files", "--others").splitlines()
+    return sorted(
+        path
+        for path in present_untracked
+        if path in tracked_in_pin
+        or path in tracked_ancestors
+        or not path_ancestors(path).isdisjoint(tracked_in_pin)
+    )
 
 
 def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
@@ -251,18 +270,17 @@ def synchronize(pins: dict[str, str]) -> int:
             all_synced = False
             continue
 
+        # Verify HEAD only: a pre-existing local file can legitimately be
+        # ignored at the old HEAD but untracked at the pin, so a
+        # dirty-after check would misreport a correct checkout.
         try:
             final_head = head_sha(repo)
-            final_dirty = worktree_is_dirty(repo)
         except GitInspectionError as exc:
             print(f"{name}: error: cannot verify checkout: {exc}")
             all_synced = False
             continue
-        if final_head != pin or final_dirty:
-            detail = (
-                "working tree became dirty" if final_dirty else "HEAD missed the pin"
-            )
-            print(f"{name}: error: checkout verification failed: {detail}")
+        if final_head != pin:
+            print(f"{name}: error: checkout verification failed: HEAD missed the pin")
             all_synced = False
             continue
         print(f"{name}: checked out pin {abbreviated(pin)}")
