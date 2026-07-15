@@ -1,0 +1,4 @@
+# Sibling repository pins; see issue #1.
+ephemeris = "15b894547919f7ab924aa8089f7c451b6f890482"
+atlas = "5c32b0540cd12ff43b5c5bcfcfae5c7d7f66bd30"
+exp2res = "e0d0bde34d3c4fe55e83a6856227f54b16b973d0"

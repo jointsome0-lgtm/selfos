@@ -36,7 +36,7 @@ Decided 2026-07-05. The README states the public shape; the working rules for ag
 
 ## Current stage
 
-No orchestration yet — atlas is a spec under active refinement; exp2res is entering implementation. Subsystem versions are pinned via a version manifest + bootstrap script (decided 2026-07-15, #1): a pins file mapping repo → SHA plus a sync/status command operating on the sibling checkouts — never git submodules (they would duplicate the sibling layout). Package-level pinning (`uv.lock` over git tags) is the declared endpoint once subsystems are installable; the manifest then either folds into it or stays as the dev-checkout pin. Orchestration (run-everything) waits until at least two subsystems are genuinely runnable; `selfos doctor` is tracked in #7.
+No orchestration yet — atlas is a spec under active refinement; exp2res is entering implementation. Subsystem version pinning is implemented in `pins.toml` plus `scripts/sync.py` (decided 2026-07-15, #1): the manifest maps repo → SHA and the sync/status command operates on the sibling checkouts — never git submodules (they would duplicate the sibling layout). The first staged `selfos doctor` slice exists as `scripts/doctor.py` per #7. Package-level pinning (`uv.lock` over git tags) is the declared endpoint once subsystems are installable; the manifest then either folds into it or stays as the dev-checkout pin. Orchestration (run-everything) waits until at least two subsystems are genuinely runnable.
 
 ## Public data boundary
 
