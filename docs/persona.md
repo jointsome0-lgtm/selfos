@@ -28,6 +28,14 @@ future fixture.
 - **Occupation:** technical writer.
 - **Learning interests:** Kubernetes operations, human anatomy,
   strength-training basics, and backend distributed systems in Python.
+- **GitHub identity:** login `vera-example`; her one public repository
+  is `vera-example/k8s-playbook` (fictional, like every entity here).
+- **Personal projects:**
+  - *K8s Playbook* — a public documentation project: runbook-style
+    notes on Kubernetes operations, kept in
+    `vera-example/k8s-playbook`.
+  - *Strength Basics* — a personal beginner strength-training routine
+    with anatomy notes; no repository, tracked only in her own logs.
 - **Tone:** mundane and small; this is demo data, not fiction writing.
 
 ## One identity
