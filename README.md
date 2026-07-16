@@ -1,6 +1,6 @@
 # selfos
 
-Personal state platform: three independent local-first systems, one honest picture of self.
+Selfos is the integration repository for three independent local-first systems — ephemeris (activity), atlas (knowledge), and exp2res (experience). Each subsystem owns its own data and semantics; selfos owns what crosses their boundaries: contracts, deterministic adapters, compatible-version pins, shared configuration, and UI composition. Subsystem-owned private instances remain canonical.
 
 | Repository | Role | Readiness |
 |---|---|---|
