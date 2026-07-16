@@ -10,7 +10,7 @@ Shared infrastructure, also a sibling: `../tollgate` — LLM gateway + spend das
 
 ## Design intent
 
-Decided 2026-07-06. The primary goal is observation: a picture of what the user possibly knows, has studied, has done. Honesty is a quality requirement on that picture — it must stay derivable from recorded facts (hence evidence with per-source strength, state snapshots, no mastery scores) — not a separate driver above it.
+Decided 2026-07-06, rescoped 2026-07-17 (#30). Selfos integrates independent subsystems through explicit contracts and deterministic adapters. Source records and domain semantics stay owned by ephemeris, atlas, and exp2res; selfos does not infer identity, growth, understanding, or mastery — it maps formats, routes by domain, and composes UIs. Canonical boundaries live in [docs/architecture.md](docs/architecture.md); current implementation status in [docs/readiness.md](docs/readiness.md).
 
 ## Shared agent skills
 
