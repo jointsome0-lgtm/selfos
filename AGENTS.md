@@ -2,11 +2,11 @@
 
 This is the integration level of selfos. The three subsystems are independent repositories, expected to be checked out as siblings of this repo:
 
-- `../ephemeris` — activity ledger (FastAPI + SQLite, v0 feature-complete)
-- `../atlas` — knowledge-state graph (SDD stage, no code yet)
-- `../exp2res` — evidence-backed self-assessment (SDD stage, no code yet)
+- `../ephemeris` — activity-ledger implementation (FastAPI + SQLite, v0 feature-complete)
+- `../atlas` — knowledge-state graph (partial freeze; knowledge vertical active, Body Atlas frozen)
+- `../exp2res` — evidence-backed self-assessment (SDD v0.3, implementation-ready with controlled amendments)
 
-Shared infrastructure, also a sibling: `../tollgate` — LLM gateway + spend dashboard (Go + TS; learning lane, see its AGENTS.md; SDD stage, no code yet).
+Shared infrastructure, also a sibling: `../tollgate` — LLM gateway + spend dashboard (Go + TS; refinement / Track B learning lane, see its AGENTS.md).
 
 ## Design intent
 
@@ -36,7 +36,7 @@ Decided 2026-07-05. The README states the public shape; the working rules for ag
 
 ## Current stage
 
-No orchestration yet — atlas is a spec under active refinement; exp2res is entering implementation. Subsystem version pinning is implemented in `pins.toml` plus `scripts/sync.py` (decided 2026-07-15, #1): the manifest maps repo → SHA and the sync/status command operates on the sibling checkouts — never git submodules (they would duplicate the sibling layout). The first staged `selfos doctor` slice exists as `scripts/doctor.py` per #7. Package-level pinning (`uv.lock` over git tags) is the declared endpoint once subsystems are installable; the manifest then either folds into it or stays as the dev-checkout pin. Orchestration (run-everything) waits until at least two subsystems are genuinely runnable.
+The canonical per-repository states, allowed implementation frontiers, issue gates, friction rules, and transition triggers live in [docs/readiness.md](docs/readiness.md). Read that matrix before slicing or implementing work.
 
 ## Public data boundary
 

@@ -2,15 +2,17 @@
 
 Personal state platform: three independent local-first systems, one honest picture of self.
 
-| System | Question it answers | Status |
+| Repository | Role | Readiness |
 |---|---|---|
-| [ephemeris](https://github.com/jointsome0-lgtm/ephemeris) | What do I do? — activity ledger: routines, tasks, focus | v0 feature-complete |
-| [atlas](https://github.com/jointsome0-lgtm/atlas) | What do I know? — graph-first knowledge-state system | SDD draft |
-| [exp2res](https://github.com/jointsome0-lgtm/exp2res) | What have I lived? — evidence-backed self-assessment | SDD draft |
+| selfos | Cross-system map, contracts, and integration | Implementation-ready for named integration slices |
+| [ephemeris](https://github.com/jointsome0-lgtm/ephemeris) | What do I do? — activity ledger: routines, tasks, focus | Implementation repository; v0 feature-complete |
+| [atlas](https://github.com/jointsome0-lgtm/atlas) | What do I know? — graph-first knowledge-state system | Partial freeze; knowledge vertical active, Body Atlas frozen |
+| [exp2res](https://github.com/jointsome0-lgtm/exp2res) | What have I lived? — evidence-backed self-assessment | Implementation-ready with controlled amendments; SDD v0.3 binding |
+| [tollgate](https://github.com/jointsome0-lgtm/tollgate) | Shared local LLM gateway and spend dashboard | Refinement / Track B learning lane |
 
-Shared infrastructure: [tollgate](https://github.com/jointsome0-lgtm/tollgate) — local LLM gateway (Go) with a TypeScript spend dashboard: one OpenAI-compatible endpoint metering token spend and routing across free daily quotas and cheap providers. Learning-lane repo (owner-built core); SDD draft.
+The concise [readiness matrix](docs/readiness.md) is canonical for what may proceed, its issue gates, how implementation friction is handled, and what changes each state next.
 
-This is the integration repository: the cross-system map, shared conventions, and — once the subsystems mature — pinned versions (git submodules) and orchestration to run everything together.
+This is the integration repository: it owns the cross-system map, shared conventions, version selection, and named integration slices. `pins.toml` records exact subsystem commit SHAs; `python scripts/sync.py --status` reports drift in the subsystem sibling checkouts, and `python scripts/sync.py` checks out locally available pins while refusing dirty or unsafe checkouts. A generic run-everything orchestrator remains deferred until at least two subsystems are genuinely runnable with known startup and configuration contracts.
 
 ## Integration model
 
