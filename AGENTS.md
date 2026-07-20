@@ -14,7 +14,7 @@ Decided 2026-07-06, rescoped 2026-07-17 (#30). Selfos integrates independent sub
 
 ## Shared agent skills
 
-Cross-repo Claude Code skills live in the sibling `selfos-skills` repository (`../selfos-skills`; GitHub: `jointsome0-lgtm/selfos-skills`) — a Claude Code plugin marketplace. Install once at user scope: `/plugin marketplace add jointsome0-lgtm/selfos-skills` (or the local checkout path), then `/plugin install sdd@selfos` (the marketplace inside is named `selfos`). The `sdd` plugin ships `grill-sdd` (grill a spec section by section; outcomes land as SDD edits + issues). Repo-specific skills stay in each repo's `.claude/skills/`; if a needed skill is missing in a session, ask the user to install/update the plugin.
+Cross-repo Claude Code skills live in the sibling `selfos-skills` repository (`../selfos-skills`; GitHub: `jointsome0-lgtm/selfos-skills`) — an Agent Skills catalog. Install once at user scope: `npx skills add jointsome0-lgtm/selfos-skills --skill grill-sdd slice sdd-conventions --agent claude-code --global --yes` (full catalog: `--skill '*'`). This installs the `grill-sdd` skill (grill a spec section by section; outcomes land as SDD edits + issues). Repo-specific skills stay in each repo's `.claude/skills/`; if a needed skill is missing in a session, ask the user to install/update it with the same command.
 
 ## Task routing
 
