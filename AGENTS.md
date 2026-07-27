@@ -45,3 +45,5 @@ This repository is public. Same policy as ephemeris: never commit real personal 
 The ecosystem deletion contract — two tiers, the purge runbook, the honest residual-copy inventory — is [docs/deletion.md](docs/deletion.md); subsystem docs point at it and never restate it.
 
 The topology behind the policy is public-engine/private-instance ([docs/architecture.md](docs/architecture.md), [docs/instance.md](docs/instance.md)); demo fixtures are authored by the synthetic persona ([docs/persona.md](docs/persona.md)); the hygiene gate ([docs/hygiene.md](docs/hygiene.md), `scripts/check_public_hygiene.py`, pre-commit + CI) fails when a known private-data path or an unmarked fixture is visible to the public git layer; real capture stays blocked until a private destination is configured.
+
+Git worktrees: create them only in `.worktrees/<name>` inside the repo (globally gitignored via `~/.config/git/ignore`), never as sibling directories.
