@@ -17,6 +17,37 @@ copies is owner discipline backed by standing rules — not a mechanism
 that can see unregistered copies. Every claim below is scoped by that
 sentence.
 
+## What is active when
+
+Decided 2026-07-28. This page divides by what its parts depend on, and
+one half depends on a condition that is not met by default.
+
+**Always active** — *Two tiers* and the record-level purge semantics
+below. These are data-model contracts: what a delete means, which
+derived rows fall with it, which survive with dangling refs. Stores
+build their own contracts against them, so they hold from the first
+record onward.
+
+**Active from the first off-machine copy** — standing preconditions 1,
+2 and 5, *Storage configurations*, *The purge runbook*, and the
+manifest/registry formats. Their entire job is to make revocation
+reach copies the owner cannot see from where they stand. An instance
+with no remote, no clone and no backup medium outside its own host has
+no such copies: "where are the copies" is answered by location, not by
+a registry, and registering same-machine copies line by line buys
+nothing. Until then these parts are inert — not weakened, out of
+scope.
+
+The trigger is mechanical: the first durable copy that leaves the host
+— external drive, second machine, any hosted or third-party storage —
+activates all of them at once, beginning with writing the manifest
+that the copy rides in.
+
+Preconditions 3 (plaintext never leaves controlled hardware), 4
+(full-disk encryption) and 6 (adapters keep no content copies) are
+unconditional; a live instance departing from one records the
+departure on its own side.
+
 ## Two tiers
 
 **Logical deletion** — the everyday default for every class of data.
@@ -53,7 +84,9 @@ page ([ephemeris#17](https://github.com/jointsome0-lgtm/ephemeris/issues/17),
 
 ## Standing preconditions
 
-These hold at all times — they are what makes revocation finite:
+These are what make revocation finite. Items 3, 4 and 6 hold at all
+times; 1, 2 and 5 activate with the first off-machine copy (see *What
+is active when*):
 
 1. **Copies manifest** — an instance-side file listing every durable
    copy: remotes, clones, backup media (name, kind, location,
