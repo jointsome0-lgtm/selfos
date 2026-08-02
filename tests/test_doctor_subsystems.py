@@ -71,6 +71,8 @@ def synthetic_pending_wal(page_size: int = 512) -> bytes:
 def make_atlas(root: Path) -> Path:
     """Create the required directories and a healthy real-layout receipt tail."""
     (root / "atlas").mkdir(parents=True)
+    (root / "plans").mkdir()
+    (root / "intake").mkdir()
     (root / "state").mkdir()
     (root / "state" / "receipts.jsonl").write_text(
         '{"intake":"fixture/source#1","marker":"opened"}\n'
@@ -245,6 +247,27 @@ def test_wal_without_shm_makes_schema_and_integrity_unverified_without_mutation(
             assert "WAL tail is not visible" in finding.detail
     finally:
         writer.close()
+
+
+def test_symlinked_database_probes_wal_beside_resolved_target(
+    isolated_doctor: Path,
+) -> None:
+    make_ephemeris_engine(isolated_doctor, 1)
+    root = isolated_doctor.parent / "private-symlink-root"
+    root.mkdir()
+    target_root = isolated_doctor.parent / "private-symlink-target"
+    target = make_database(target_root, 1)
+    target.with_name(target.name + "-wal").write_bytes(synthetic_pending_wal())
+    (root / "activity.sqlite").symlink_to(target)
+    fresh_backup(root)
+    sidecars_before = sidecar_metadata(target)
+
+    checks = doctor.ephemeris_checks(root, False)
+
+    assert by_id(checks, "subsystem.ephemeris.database_readable").status == "ok"
+    assert by_id(checks, "subsystem.ephemeris.schema_compatible").status == "warning"
+    assert by_id(checks, "subsystem.ephemeris.integrity_check").status == "warning"
+    assert sidecar_metadata(target) == sidecars_before
 
 
 def test_unreadable_wal_makes_schema_and_integrity_unverified(
@@ -477,6 +500,24 @@ def test_future_backup_timestamp_warns_and_cannot_mask_stale_backup(
     assert "private-future-backup" not in finding.detail
 
 
+def test_backup_entry_cap_warns_without_scanning_every_entry(
+    isolated_doctor: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = isolated_doctor.parent / "private-many-backups"
+    backups = root / "backups"
+    backups.mkdir(parents=True)
+    (backups / "first.backup").write_bytes(b"")
+    (backups / "second.backup").write_bytes(b"")
+    monkeypatch.setattr(doctor, "EPHEMERIS_MAX_BACKUP_ENTRIES", 1)
+
+    finding = doctor._ephemeris_backup_check(root, False)
+
+    assert finding.status == "warning"
+    assert "safety cap was exceeded" in finding.detail
+    assert "private-many-backups" not in finding.detail
+
+
 def test_backup_freshness_ignores_directories_fifos_and_symlinks(
     isolated_doctor: Path,
 ) -> None:
@@ -563,6 +604,22 @@ def test_atlas_writer_lock_is_warning_and_is_not_removed(
     checks = doctor.atlas_checks(root, False)
     assert by_id(checks, "subsystem.atlas.writer_lock").status == "warning"
     assert lock.exists()
+
+
+@pytest.mark.parametrize("missing", ["plans", "intake"])
+def test_atlas_layout_requires_complete_canonical_skeleton(
+    isolated_doctor: Path,
+    missing: str,
+) -> None:
+    root = make_atlas(isolated_doctor.parent / f"atlas-missing-{missing}")
+    (root / missing).rmdir()
+
+    checks = doctor.atlas_checks(root, False)
+
+    layout = by_id(checks, "subsystem.atlas.instance_layout")
+    assert layout.status == "blocked"
+    assert "atlas-missing" not in layout.detail
+    assert {check.status for check in checks[1:]} == {"not_applicable"}
 
 
 def test_malformed_journal_reports_only_name_and_row(isolated_doctor: Path) -> None:

@@ -50,6 +50,7 @@ VERIFIED_LINE = re.compile(r"^Last verified: (\d{4}-\d{2}-\d{2})(?:\s|$)")
 STATUS_RANK = {"not_applicable": 0, "ok": 0, "warning": 1, "blocked": 2}
 APPROVED_RUNNERS = ("codex", "claude")
 BACKUP_RECENT_DAYS = 7
+EPHEMERIS_MAX_BACKUP_ENTRIES = 4096
 OVERRIDE_RECENT_DAYS = 90
 RUNNER_VERSION_TIMEOUT_SECONDS = 3
 RUNNER_VERSION_MAX_BYTES = 4 * 1024
@@ -643,7 +644,16 @@ def _ephemeris_backup_check(root: Path, show_paths: bool) -> Check:
     newest: float | None = None
     try:
         with os.scandir(directory_fd) as entries:
-            for entry in entries:
+            for index, entry in enumerate(entries):
+                if index >= EPHEMERIS_MAX_BACKUP_ENTRIES:
+                    return Check(
+                        "subsystem.ephemeris.backup_recent",
+                        "ephemeris",
+                        "warning",
+                        "backup recency was not fully checked because a safety "
+                        "cap was exceeded",
+                        remediation,
+                    )
                 try:
                     info = entry.stat(follow_symlinks=False)
                 except OSError:
@@ -840,8 +850,9 @@ def ephemeris_checks(
         database_is_regular = False
     else:
         try:
-            database_is_regular = stat.S_ISREG(database.stat().st_mode)
-        except OSError:
+            effective_database = database.resolve(strict=True)
+            database_is_regular = stat.S_ISREG(effective_database.stat().st_mode)
+        except (OSError, RuntimeError):
             database_is_regular = False
 
     if not database_is_regular:
@@ -870,7 +881,7 @@ def ephemeris_checks(
             _ephemeris_backup_check(root, show_paths),
         ]
 
-    wal = database.with_name(database.name + "-wal")
+    wal = effective_database.with_name(effective_database.name + "-wal")
     wal_pending = _sqlite_has_pending_wal(wal)
     wal_unverified = wal_pending is not False
     wal_reason = (
@@ -887,7 +898,7 @@ def ephemeris_checks(
     connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(
-            database.absolute().as_uri() + "?mode=ro&immutable=1",
+            effective_database.as_uri() + "?mode=ro&immutable=1",
             uri=True,
             timeout=0.2,
         )
@@ -1070,7 +1081,7 @@ def _strict_json_loads(text: str) -> object:
 
 
 def _atlas_layout_check(root: Path | None, show_paths: bool) -> tuple[Check, bool]:
-    """Prove both required directories no-follow before any deeper inspection."""
+    """Prove the canonical four-directory skeleton without following symlinks."""
     if root is None:
         return Check(
             "subsystem.atlas.instance_layout",
@@ -1080,14 +1091,15 @@ def _atlas_layout_check(root: Path | None, show_paths: bool) -> tuple[Check, boo
         ), False
     opened: list[int] = []
     try:
-        opened.append(_open_directory_no_follow(root / "atlas"))
-        opened.append(_open_directory_no_follow(root / "state"))
+        for name in ("atlas", "plans", "intake", "state"):
+            opened.append(_open_directory_no_follow(root / name))
     except OSError:
         return Check(
             "subsystem.atlas.instance_layout",
             "atlas",
             "blocked",
-            "configured root lacks safe atlas/ and state/ directories"
+            "configured root lacks safe atlas/, plans/, intake/, and state/ "
+            "directories"
             + path_suffix(root, show_paths),
             "Choose or restore a valid Atlas instance; doctor will not create it.",
         ), False
@@ -1098,7 +1110,7 @@ def _atlas_layout_check(root: Path | None, show_paths: bool) -> tuple[Check, boo
         "subsystem.atlas.instance_layout",
         "atlas",
         "ok",
-        "configured root has safe atlas/ and state/ directories"
+        "configured root has safe atlas/, plans/, intake/, and state/ directories"
         + path_suffix(root, show_paths),
     ), True
 
