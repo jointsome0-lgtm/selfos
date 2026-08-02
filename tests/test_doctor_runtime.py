@@ -91,6 +91,23 @@ def test_runner_inside_sibling_checkout_is_not_resolved(
     assert found == {}
 
 
+def test_looping_symlink_on_path_is_skipped(
+    isolated_doctor: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = isolated_doctor.parent / "runner-loop-first"
+    second = isolated_doctor.parent / "runner-loop-second"
+    first.symlink_to(second)
+    second.symlink_to(first)
+    monkeypatch.setattr(doctor, "_safe_runner_path", SAFE_RUNNER_PATH)
+    monkeypatch.setattr(doctor.os, "get_exec_path", lambda: [str(first)])
+
+    search_path, found = doctor._safe_runner_path([])
+
+    assert search_path == ""
+    assert found == {}
+    assert doctor._is_within(first, []) is True
+
+
 def test_stale_override_reports_only_date_and_age(isolated_doctor: Path) -> None:
     override = isolated_doctor.parent / "private-override-marker.md"
     verified = dt.date.today() - dt.timedelta(days=91)

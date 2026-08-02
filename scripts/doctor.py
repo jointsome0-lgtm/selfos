@@ -794,8 +794,6 @@ def ephemeris_checks(
         ]
     try:
         database.lstat()
-        if not stat.S_ISREG(database.stat().st_mode):
-            raise OSError
     except FileNotFoundError:
         absent = "ledger database is absent; real capture remains blocked by design"
         return [
@@ -820,6 +818,14 @@ def ephemeris_checks(
             _ephemeris_backup_check(root, show_paths),
         ]
     except OSError:
+        database_is_regular = False
+    else:
+        try:
+            database_is_regular = stat.S_ISREG(database.stat().st_mode)
+        except OSError:
+            database_is_regular = False
+
+    if not database_is_regular:
         unreadable = Check(
             "subsystem.ephemeris.database_readable",
             "ephemeris",
@@ -1218,6 +1224,10 @@ def _atlas_journal_scan(root: Path, show_paths: bool) -> AtlasJournalScan:
             return stem != "receipts", stem, directory is None, name
 
         journal_names.sort(key=journal_order)
+        # Atlas engine authority is spec/08-repository-layout.md,
+        # spec/schemas/journal-receipt.schema.json, scripts/atlas_io.py, and
+        # validate_atlas.py:547-553: receipts.jsonl plus receipts/ are receipts.
+        # docs/instance.md is stale here and remains for its owner to correct.
         receipt_files = sum(
             directory == "receipts" or (directory is None and name == "receipts.jsonl")
             for directory, name in journal_names
@@ -1556,9 +1566,15 @@ def atlas_checks(
 
 def _is_within(path: Path, roots: list[Path]) -> bool:
     """Reject runner candidates from any inspected code or data root."""
-    candidates = {path, path.resolve()}
+    try:
+        candidates = {path, path.resolve()}
+    except (OSError, RuntimeError):
+        return True
     for root in roots:
-        root_candidates = {root, root.resolve()}
+        try:
+            root_candidates = {root, root.resolve()}
+        except (OSError, RuntimeError):
+            return True
         if any(
             candidate.is_relative_to(base)
             for candidate in candidates

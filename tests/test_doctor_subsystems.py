@@ -114,6 +114,32 @@ def test_unopenable_database_error_is_summarised_without_path(
     assert "private-unopenable-marker" not in finding.detail
 
 
+def test_dangling_database_symlink_is_blocked_as_unreadable(
+    isolated_doctor: Path,
+) -> None:
+    root = isolated_doctor.parent / "private-dangling-ledger"
+    root.mkdir()
+    database = root / "activity.sqlite"
+    database.symlink_to(root / "missing-ledger-target")
+    fresh_backup(root)
+
+    checks = doctor.ephemeris_checks(root, False)
+
+    readable = by_id(checks, "subsystem.ephemeris.database_readable")
+    assert readable.status == "blocked"
+    assert readable.remediation == (
+        "Restore readable database storage; doctor will not repair it."
+    )
+    assert "private-dangling-ledger" not in readable.detail
+    assert by_id(checks, "subsystem.ephemeris.schema_compatible").status == (
+        "not_applicable"
+    )
+    assert by_id(checks, "subsystem.ephemeris.integrity_check").status == (
+        "not_applicable"
+    )
+    assert by_id(checks, "subsystem.ephemeris.backup_recent").status == "ok"
+
+
 def test_busy_database_does_not_block_immutable_inspection(
     isolated_doctor: Path,
 ) -> None:
