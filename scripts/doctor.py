@@ -1,23 +1,28 @@
-"""Diagnose whether the selfos repository and private roots are coherent.
+"""Diagnose whether the selfos workspace is locally coherent.
 
-This first staged slice implements issue #7's repository and private-instance
-topology checks. It is read-only, offline, never invokes a model, and never
-clones, fetches, repairs, or otherwise mutates a checkout or instance. Because
-doctor checks all subsystems together, private roots are discovered from each
-subsystem environment variable and then ``~/.config/selfos/config.toml``;
-doctor has no per-subsystem ``--instance`` flag. Requires Python 3.11+
-(tomllib).
+This staged issue #7 implementation checks repository and private-instance
+topology, ephemeris and Atlas subjects, and the approved agent runtimes. It is
+read-only, offline, never invokes a model, and never clones, fetches, repairs,
+or otherwise mutates a checkout or instance. Because doctor checks all
+subsystems together, private roots are discovered from each subsystem
+environment variable and then ``~/.config/selfos/config.toml``; doctor has no
+per-subsystem ``--instance`` flag. Requires Python 3.11+ (tomllib).
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import functools
 import json
 import os
 import re
+import shutil
+import sqlite3
+import stat
 import subprocess
 import sys
+import time
 import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -33,7 +38,16 @@ ENV_VARS = {
     "exp2res": "EXP2RES_WORKSPACE",
 }
 FULL_SHA = re.compile(r"[0-9a-fA-F]{40}")
+SCHEMA_VERSION_LINE = re.compile(r"^\s*SCHEMA_VERSION\s*=\s*(\d+)\s*(?:#.*)?$")
+VERIFIED_LINE = re.compile(r"^Last verified: (\d{4}-\d{2}-\d{2})(?:\s|$)")
 STATUS_RANK = {"not_applicable": 0, "ok": 0, "warning": 1, "blocked": 2}
+APPROVED_RUNNERS = ("codex", "claude")
+BACKUP_RECENT_DAYS = 7
+OVERRIDE_RECENT_DAYS = 90
+RUNNER_VERSION_TIMEOUT_SECONDS = 3
+ATLAS_MAX_STATE_ENTRIES = 1024
+ATLAS_MAX_JOURNALS = 256
+ATLAS_MAX_JOURNAL_BYTES = 8 * 1024 * 1024
 
 
 class ManifestError(ValueError):
@@ -55,15 +69,25 @@ class Check:
     remediation: str = ""
 
 
-def load_pins(path: Path = PINS_PATH) -> dict[str, str]:
-    """Load exactly one full commit SHA for each expected sibling."""
+@dataclass(frozen=True)
+class AtlasJournalScan:
+    """Carry receipt rows only when the journal check proved them safe to use."""
+
+    check: Check
+    receipts_present: bool = False
+    receipt_rows: tuple[object, ...] | None = None
+
+
+def load_pins(path: Path | None = None) -> dict[str, str]:
+    """Resolve the manifest at call time so isolated callers cannot hit the host."""
+    path = PINS_PATH if path is None else path
     try:
         with path.open("rb") as manifest:
             data = tomllib.load(manifest)
     except FileNotFoundError as exc:
         raise ManifestError("pins.toml is missing") from exc
     except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise ManifestError(f"cannot read pins.toml: {exc}") from exc
+        raise ManifestError("cannot read pins.toml") from exc
 
     keys = set(data)
     expected = set(EXPECTED_REPOS)
@@ -311,13 +335,13 @@ def repo_checks(
     return checks
 
 
-def load_config_instances() -> dict[str, str]:
-    """Read configured instance values, treating a missing config as empty."""
+def load_user_config() -> tuple[dict[str, str], str | None]:
+    """Keep config failures explicit so doctor never guesses around bad policy."""
     try:
         with CONFIG_PATH.open("rb") as config_file:
             data = tomllib.load(config_file)
     except FileNotFoundError:
-        return {}
+        return {}, None
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise DoctorInternalError("cannot parse the user-scope selfos config") from exc
 
@@ -336,7 +360,22 @@ def load_config_instances() -> dict[str, str]:
             )
         if value:
             configured[label] = value
-    return configured
+
+    runtime = data.get("runtime", {})
+    if not isinstance(runtime, dict):
+        raise DoctorInternalError("the user-scope [runtime] value is not a table")
+    override_path = runtime.get("override_path")
+    if override_path is not None and not isinstance(override_path, str):
+        raise DoctorInternalError(
+            "the user-scope runtime.override_path value is not a string"
+        )
+    return configured, override_path or None
+
+
+def load_config_instances() -> dict[str, str]:
+    """Preserve the shipped instances-only loader for existing callers."""
+    instances, _override_path = load_user_config()
+    return instances
 
 
 def discover_instance(
@@ -445,8 +484,1013 @@ def instance_checks(
     return checks
 
 
+def _age_days(timestamp: float) -> int:
+    """Clamp future mtimes so clock skew cannot produce a misleading age."""
+    return max(0, int((time.time() - timestamp) // 86400))
+
+
+def _open_directory_no_follow(path: Path) -> int:
+    """Bind every directory component so inspection cannot escape via symlink."""
+    absolute = Path(os.path.abspath(path))
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_fd = os.open(absolute.anchor, flags)
+    try:
+        for component in absolute.parts[1:]:
+            info = os.stat(component, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode):
+                raise OSError
+            next_fd = os.open(component, flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def _sqlite_is_busy(exc: sqlite3.Error) -> bool:
+    """Separate transient writer contention from stable database damage."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int) and (code & 0xFF) in {
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+    }:
+        return True
+    lowered = str(exc).lower()
+    return "locked" in lowered or "busy" in lowered
+
+
+def _ephemeris_schema_version() -> int | None:
+    """Read the engine constant as text to avoid import-time app configuration."""
+    source = ROOT.parent / "ephemeris" / "app" / "db.py"
+    try:
+        with source.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                if match := SCHEMA_VERSION_LINE.fullmatch(line.rstrip("\n")):
+                    return int(match.group(1))
+    except (OSError, UnicodeError):
+        return None
+    return None
+
+
+def _ephemeris_backup_check(root: Path, show_paths: bool) -> Check:
+    """Use mtimes only so backup health never opens or names private snapshots."""
+    backups = root / "backups"
+    remediation = "Run python -m scripts.backup_db in ephemeris."
+    try:
+        directory_fd = _open_directory_no_follow(backups)
+    except (FileNotFoundError, NotADirectoryError):
+        return Check(
+            "subsystem.ephemeris.backup_recent",
+            "ephemeris",
+            "warning",
+            "no backup directory is available" + path_suffix(backups, show_paths),
+            remediation,
+        )
+    except OSError:
+        return Check(
+            "subsystem.ephemeris.backup_recent",
+            "ephemeris",
+            "warning",
+            "backup recency could not be checked now"
+            + path_suffix(backups, show_paths),
+            remediation,
+        )
+
+    newest: float | None = None
+    try:
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                try:
+                    modified = entry.stat(follow_symlinks=False).st_mtime
+                except OSError:
+                    return Check(
+                        "subsystem.ephemeris.backup_recent",
+                        "ephemeris",
+                        "warning",
+                        "backup recency could not be checked now",
+                        remediation,
+                    )
+                newest = modified if newest is None else max(newest, modified)
+    except OSError:
+        return Check(
+            "subsystem.ephemeris.backup_recent",
+            "ephemeris",
+            "warning",
+            "backup recency could not be checked now",
+            remediation,
+        )
+    finally:
+        os.close(directory_fd)
+
+    if newest is None:
+        return Check(
+            "subsystem.ephemeris.backup_recent",
+            "ephemeris",
+            "warning",
+            "no backups are available",
+            remediation,
+        )
+    age = _age_days(newest)
+    if age > BACKUP_RECENT_DAYS:
+        return Check(
+            "subsystem.ephemeris.backup_recent",
+            "ephemeris",
+            "warning",
+            f"newest backup is {age} whole days old",
+            remediation,
+        )
+    return Check(
+        "subsystem.ephemeris.backup_recent",
+        "ephemeris",
+        "ok",
+        f"newest backup is {age} whole days old",
+    )
+
+
+def ephemeris_checks(root: Path | None, show_paths: bool) -> list[Check]:
+    """Keep one read-only connection so the three database views agree."""
+    if root is None:
+        reason = "ephemeris private root is not configured"
+        return [
+            Check(
+                "subsystem.ephemeris.database_readable",
+                "ephemeris",
+                "not_applicable",
+                reason,
+            ),
+            Check(
+                "subsystem.ephemeris.schema_compatible",
+                "ephemeris",
+                "not_applicable",
+                reason,
+            ),
+            Check(
+                "subsystem.ephemeris.integrity_check",
+                "ephemeris",
+                "not_applicable",
+                reason,
+            ),
+            Check(
+                "subsystem.ephemeris.backup_recent",
+                "ephemeris",
+                "not_applicable",
+                reason,
+            ),
+        ]
+
+    override = os.environ.get("ACTIVITY_DB")
+    database = (
+        Path(os.path.abspath(Path(override).expanduser()))
+        if override
+        else root / "activity.sqlite"
+    )
+    try:
+        database.lstat()
+        if not stat.S_ISREG(database.stat().st_mode):
+            raise OSError
+    except FileNotFoundError:
+        absent = "ledger database is absent; real capture remains blocked by design"
+        return [
+            Check(
+                "subsystem.ephemeris.database_readable",
+                "ephemeris",
+                "not_applicable",
+                absent,
+            ),
+            Check(
+                "subsystem.ephemeris.schema_compatible",
+                "ephemeris",
+                "not_applicable",
+                absent,
+            ),
+            Check(
+                "subsystem.ephemeris.integrity_check",
+                "ephemeris",
+                "not_applicable",
+                absent,
+            ),
+            _ephemeris_backup_check(root, show_paths),
+        ]
+    except OSError:
+        unreadable = Check(
+            "subsystem.ephemeris.database_readable",
+            "ephemeris",
+            "blocked",
+            "ledger database is present but cannot be inspected"
+            + path_suffix(database, show_paths),
+            "Restore readable database storage; doctor will not repair it.",
+        )
+        return [
+            unreadable,
+            Check(
+                "subsystem.ephemeris.schema_compatible",
+                "ephemeris",
+                "not_applicable",
+                "schema cannot be checked because the database is unreadable",
+            ),
+            Check(
+                "subsystem.ephemeris.integrity_check",
+                "ephemeris",
+                "not_applicable",
+                "integrity cannot be checked because the database is unreadable",
+            ),
+            _ephemeris_backup_check(root, show_paths),
+        ]
+
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            database.absolute().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=0.2,
+        )
+        row = connection.execute("PRAGMA user_version").fetchone()
+        if row is None or not isinstance(row[0], int):
+            raise sqlite3.DatabaseError("invalid user_version result")
+        actual_version = row[0]
+    except sqlite3.Error as exc:
+        transient = _sqlite_is_busy(exc)
+        status = "warning" if transient else "blocked"
+        detail = (
+            "ledger database could not be checked now"
+            if transient
+            else "ledger database is present but cannot be opened read-only"
+        )
+        readability = Check(
+            "subsystem.ephemeris.database_readable",
+            "ephemeris",
+            status,
+            detail + path_suffix(database, show_paths),
+            "Try again after the active database operation finishes."
+            if transient
+            else "Restore a readable SQLite ledger; doctor will not repair it.",
+        )
+        if connection is not None:
+            connection.close()
+        return [
+            readability,
+            Check(
+                "subsystem.ephemeris.schema_compatible",
+                "ephemeris",
+                "not_applicable",
+                "schema cannot be checked because the database did not open",
+            ),
+            Check(
+                "subsystem.ephemeris.integrity_check",
+                "ephemeris",
+                "not_applicable",
+                "integrity cannot be checked because the database did not open",
+            ),
+            _ephemeris_backup_check(root, show_paths),
+        ]
+
+    readability = Check(
+        "subsystem.ephemeris.database_readable",
+        "ephemeris",
+        "ok",
+        "ledger database opens through a read-only SQLite connection"
+        + path_suffix(database, show_paths),
+    )
+    expected_version = _ephemeris_schema_version()
+    if expected_version is None:
+        schema = Check(
+            "subsystem.ephemeris.schema_compatible",
+            "ephemeris",
+            "not_applicable",
+            "engine schema version is unavailable from the sibling checkout",
+        )
+    elif actual_version > expected_version:
+        schema = Check(
+            "subsystem.ephemeris.schema_compatible",
+            "ephemeris",
+            "blocked",
+            f"database schema {actual_version} is newer than engine schema "
+            f"{expected_version}",
+            "Use an ephemeris engine that supports this database schema.",
+        )
+    elif actual_version < expected_version:
+        schema = Check(
+            "subsystem.ephemeris.schema_compatible",
+            "ephemeris",
+            "warning",
+            f"database schema {actual_version} is older than engine schema "
+            f"{expected_version}",
+            "Run the ephemeris migration explicitly; doctor will not run it.",
+        )
+    else:
+        schema = Check(
+            "subsystem.ephemeris.schema_compatible",
+            "ephemeris",
+            "ok",
+            f"database and engine schema versions match at {actual_version}",
+        )
+
+    try:
+        quick_rows = connection.execute("PRAGMA quick_check(1)").fetchall()
+    except sqlite3.Error as exc:
+        if _sqlite_is_busy(exc):
+            integrity = Check(
+                "subsystem.ephemeris.integrity_check",
+                "ephemeris",
+                "warning",
+                "database integrity could not be checked now",
+                "Try again after the active database operation finishes.",
+            )
+        else:
+            integrity = Check(
+                "subsystem.ephemeris.integrity_check",
+                "ephemeris",
+                "blocked",
+                "database integrity check failed",
+                "Restore the ledger from a known-good backup.",
+            )
+    else:
+        integrity = Check(
+            "subsystem.ephemeris.integrity_check",
+            "ephemeris",
+            "ok" if quick_rows == [("ok",)] else "blocked",
+            "database integrity check passed"
+            if quick_rows == [("ok",)]
+            else "database integrity check failed",
+            ""
+            if quick_rows == [("ok",)]
+            else "Restore the ledger from a known-good backup.",
+        )
+    finally:
+        connection.close()
+    return [readability, schema, integrity, _ephemeris_backup_check(root, show_paths)]
+
+
+def _safe_file_name(name: str) -> str:
+    """Keep the required filename diagnostic on one printable output line."""
+    return "".join(character if character.isprintable() else "?" for character in name)
+
+
+def _strict_json_loads(text: str) -> object:
+    """Match Atlas's duplicate-key and finite-number JSON discipline locally."""
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        """Reject ambiguity rather than silently choosing the last value."""
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+
+    def finite_number(_value: str) -> object:
+        """Keep non-standard numeric constants out of strict JSON."""
+        raise ValueError("non-finite number")
+
+    return json.loads(
+        text,
+        object_pairs_hook=unique_object,
+        parse_constant=finite_number,
+    )
+
+
+def _atlas_layout_check(root: Path | None, show_paths: bool) -> tuple[Check, bool]:
+    """Prove both required directories no-follow before any deeper inspection."""
+    if root is None:
+        return Check(
+            "subsystem.atlas.instance_layout",
+            "atlas",
+            "not_applicable",
+            "Atlas private instance is not configured",
+        ), False
+    opened: list[int] = []
+    try:
+        opened.append(_open_directory_no_follow(root / "atlas"))
+        opened.append(_open_directory_no_follow(root / "state"))
+    except OSError:
+        return Check(
+            "subsystem.atlas.instance_layout",
+            "atlas",
+            "blocked",
+            "configured root lacks safe atlas/ and state/ directories"
+            + path_suffix(root, show_paths),
+            "Choose or restore a valid Atlas instance; doctor will not create it.",
+        ), False
+    finally:
+        for directory_fd in opened:
+            os.close(directory_fd)
+    return Check(
+        "subsystem.atlas.instance_layout",
+        "atlas",
+        "ok",
+        "configured root has safe atlas/ and state/ directories"
+        + path_suffix(root, show_paths),
+    ), True
+
+
+def _parse_jsonl_bytes(data: bytes) -> tuple[tuple[object, ...] | None, int | None]:
+    """Return only parsed values or a content-free one-based failing row."""
+    if not data:
+        return (), None
+    parts = data.split(b"\n")
+    if parts[-1] != b"":
+        return None, len(parts)
+    rows: list[object] = []
+    for number, raw in enumerate(parts[:-1], start=1):
+        if not raw or b"\r" in raw:
+            return None, number
+        try:
+            text = raw.decode("utf-8", errors="strict")
+            rows.append(_strict_json_loads(text))
+        except (UnicodeError, ValueError, RecursionError):
+            return None, number
+    return tuple(rows), None
+
+
+def _atlas_journal_scan(root: Path, show_paths: bool) -> AtlasJournalScan:
+    """Bound enumeration and reads so malformed instance size cannot stall doctor."""
+    try:
+        state_fd = _open_directory_no_follow(root / "state")
+    except OSError:
+        return AtlasJournalScan(
+            Check(
+                "subsystem.atlas.journals_parse",
+                "atlas",
+                "warning",
+                "state journals could not be checked now"
+                + path_suffix(root / "state", show_paths),
+            )
+        )
+
+    capped = False
+    enumeration_capped = False
+    journal_names: list[tuple[str | None, str]] = []
+    try:
+        try:
+            with os.scandir(state_fd) as iterator:
+                entries = []
+                for entry in iterator:
+                    if len(entries) >= ATLAS_MAX_STATE_ENTRIES:
+                        capped = True
+                        enumeration_capped = True
+                        break
+                    entries.append(entry)
+        except OSError:
+            return AtlasJournalScan(Check(
+                "subsystem.atlas.journals_parse",
+                "atlas",
+                "warning",
+                "state journals could not be checked now",
+            ))
+
+        entries.sort(key=lambda entry: (entry.name != "receipts", entry.name))
+        enumerated_entries = len(entries)
+        directory_flags = os.O_RDONLY
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        for entry in entries:
+            try:
+                mode = entry.stat(follow_symlinks=False).st_mode
+            except OSError:
+                return AtlasJournalScan(Check(
+                    "subsystem.atlas.journals_parse",
+                    "atlas",
+                    "warning",
+                    "state journals could not be checked now",
+                ))
+            if stat.S_ISLNK(mode) or not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                return AtlasJournalScan(Check(
+                    "subsystem.atlas.journals_parse",
+                    "atlas",
+                    "blocked",
+                    f"state entry {_safe_file_name(entry.name)} is a symlink "
+                    "or special file",
+                    "Replace it with an lstat-confirmed regular file or directory.",
+                ))
+            if stat.S_ISREG(mode) and entry.name.endswith(".jsonl"):
+                journal_names.append((None, entry.name))
+            elif stat.S_ISDIR(mode):
+                directory_fd: int | None = None
+                try:
+                    directory_fd = os.open(
+                        entry.name,
+                        directory_flags,
+                        dir_fd=state_fd,
+                    )
+                    with os.scandir(directory_fd) as iterator:
+                        for rotated_entry in iterator:
+                            if enumerated_entries >= ATLAS_MAX_STATE_ENTRIES:
+                                capped = True
+                                enumeration_capped = True
+                                break
+                            enumerated_entries += 1
+                            try:
+                                rotated_mode = rotated_entry.stat(
+                                    follow_symlinks=False
+                                ).st_mode
+                            except OSError:
+                                return AtlasJournalScan(Check(
+                                    "subsystem.atlas.journals_parse",
+                                    "atlas",
+                                    "warning",
+                                    "state journals could not be checked now",
+                                ))
+                            if stat.S_ISLNK(rotated_mode) or not (
+                                stat.S_ISREG(rotated_mode)
+                                or stat.S_ISDIR(rotated_mode)
+                            ):
+                                return AtlasJournalScan(Check(
+                                    "subsystem.atlas.journals_parse",
+                                    "atlas",
+                                    "blocked",
+                                    f"state entry "
+                                    f"{_safe_file_name(rotated_entry.name)} "
+                                    "is a symlink or special file",
+                                    "Replace it with an lstat-confirmed regular "
+                                    "file or directory.",
+                                ))
+                            if (
+                                stat.S_ISREG(rotated_mode)
+                                and rotated_entry.name.endswith(".jsonl")
+                            ):
+                                journal_names.append(
+                                    (entry.name, rotated_entry.name)
+                                )
+                except OSError:
+                    return AtlasJournalScan(Check(
+                        "subsystem.atlas.journals_parse",
+                        "atlas",
+                        "warning",
+                        "state journals could not be checked now",
+                    ))
+                finally:
+                    if directory_fd is not None:
+                        os.close(directory_fd)
+
+        def journal_order(item: tuple[str | None, str]) -> tuple[bool, str, bool, str]:
+            directory, name = item
+            stem = directory if directory is not None else Path(name).stem
+            return stem != "receipts", stem, directory is None, name
+
+        journal_names.sort(key=journal_order)
+        receipt_files = sum(
+            directory == "receipts" or (directory is None and name == "receipts.jsonl")
+            for directory, name in journal_names
+        )
+        if len(journal_names) > ATLAS_MAX_JOURNALS:
+            capped = True
+            journal_names = journal_names[:ATLAS_MAX_JOURNALS]
+
+        receipts_present = receipt_files > 0
+        receipt_rows: list[object] = []
+        receipts_complete = not enumeration_capped and receipt_files == sum(
+            directory == "receipts" or (directory is None and name == "receipts.jsonl")
+            for directory, name in journal_names
+        )
+        file_flags = os.O_RDONLY
+        file_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        file_flags |= getattr(os, "O_NONBLOCK", 0)
+        for directory, name in journal_names:
+            parent_fd = state_fd
+            try:
+                if directory is not None:
+                    parent_fd = os.open(
+                        directory,
+                        directory_flags,
+                        dir_fd=state_fd,
+                    )
+                file_fd = os.open(name, file_flags, dir_fd=parent_fd)
+                info = os.fstat(file_fd)
+                if not stat.S_ISREG(info.st_mode):
+                    os.close(file_fd)
+                    return AtlasJournalScan(Check(
+                        "subsystem.atlas.journals_parse",
+                        "atlas",
+                        "blocked",
+                        f"state entry {_safe_file_name(name)} is a symlink "
+                        "or special file",
+                        "Replace it with an lstat-confirmed regular file.",
+                    ))
+                if info.st_size > ATLAS_MAX_JOURNAL_BYTES:
+                    os.close(file_fd)
+                    capped = True
+                    if directory == "receipts" or (
+                        directory is None and name == "receipts.jsonl"
+                    ):
+                        receipts_complete = False
+                    continue
+                with os.fdopen(file_fd, "rb") as stream:
+                    data = stream.read(ATLAS_MAX_JOURNAL_BYTES + 1)
+            except OSError:
+                return AtlasJournalScan(Check(
+                    "subsystem.atlas.journals_parse",
+                    "atlas",
+                    "warning",
+                    "state journals could not be checked now",
+                ))
+            finally:
+                if parent_fd != state_fd:
+                    os.close(parent_fd)
+            if len(data) > ATLAS_MAX_JOURNAL_BYTES:
+                capped = True
+                if directory == "receipts" or (
+                    directory is None and name == "receipts.jsonl"
+                ):
+                    receipts_complete = False
+                continue
+            rows, bad_row = _parse_jsonl_bytes(data)
+            if bad_row is not None:
+                return AtlasJournalScan(
+                    Check(
+                        "subsystem.atlas.journals_parse",
+                        "atlas",
+                        "blocked",
+                        f"journal {_safe_file_name(name)} has a malformed row "
+                        f"{bad_row}",
+                        "Repair the journal explicitly from a known-good source.",
+                    ),
+                    receipts_present=receipts_present,
+                )
+            if directory == "receipts" or (
+                directory is None and name == "receipts.jsonl"
+            ):
+                assert rows is not None
+                receipt_rows.extend(rows)
+
+        if capped:
+            return AtlasJournalScan(
+                Check(
+                    "subsystem.atlas.journals_parse",
+                    "atlas",
+                    "warning",
+                    "state journals were not fully checked because a safety "
+                    "cap was exceeded",
+                ),
+                receipts_present=receipts_present,
+                receipt_rows=tuple(receipt_rows) if receipts_complete else None,
+            )
+        return AtlasJournalScan(
+            Check(
+                "subsystem.atlas.journals_parse",
+                "atlas",
+                "ok",
+                "all bounded state journals contain strict UTF-8 "
+                "LF-terminated JSON rows",
+            ),
+            receipts_present=receipts_present,
+            receipt_rows=tuple(receipt_rows),
+        )
+    finally:
+        os.close(state_fd)
+
+
+def _atlas_lock_check(root: Path) -> Check:
+    """Inspect lock metadata only because process liveness is unknowable."""
+    try:
+        root_fd = _open_directory_no_follow(root)
+        try:
+            info = os.stat(".atlas-lock", dir_fd=root_fd, follow_symlinks=False)
+        finally:
+            os.close(root_fd)
+    except FileNotFoundError:
+        return Check(
+            "subsystem.atlas.writer_lock",
+            "atlas",
+            "ok",
+            "no writer lock is present",
+        )
+    except OSError:
+        return Check(
+            "subsystem.atlas.writer_lock",
+            "atlas",
+            "warning",
+            "writer lock age could not be checked now",
+            "Inspect it manually; stale locks are removed only by hand.",
+        )
+    return Check(
+        "subsystem.atlas.writer_lock",
+        "atlas",
+        "warning",
+        f"writer lock is present and is {_age_days(info.st_mtime)} whole days "
+        "old; writer liveness is unknown",
+        "Inspect it manually; stale locks are removed only by hand.",
+    )
+
+
+def _atlas_receipts_check(scan: AtlasJournalScan) -> Check:
+    """Count interrupted intake without retaining or revealing receipt keys."""
+    if scan.check.status == "blocked":
+        return Check(
+            "subsystem.atlas.receipts_complete",
+            "atlas",
+            "not_applicable",
+            "receipt completeness is covered by the journal parse finding",
+        )
+    if not scan.receipts_present:
+        detail = (
+            "receipt journal was not fully checked"
+            if scan.check.status == "warning"
+            else "state/receipts.jsonl and its rotated prefix are absent"
+        )
+        return Check(
+            "subsystem.atlas.receipts_complete",
+            "atlas",
+            "not_applicable",
+            detail,
+        )
+    if scan.receipt_rows is None:
+        return Check(
+            "subsystem.atlas.receipts_complete",
+            "atlas",
+            "not_applicable",
+            "receipt journal was not fully checked",
+        )
+
+    opened: set[str] = set()
+    processed: set[str] = set()
+    for row in scan.receipt_rows:
+        if not isinstance(row, dict):
+            return Check(
+                "subsystem.atlas.receipts_complete",
+                "atlas",
+                "not_applicable",
+                "receipt rows do not expose the expected content-free "
+                "bookkeeping shape",
+            )
+        marker = row.get("marker")
+        key = row.get("intake")
+        if not isinstance(key, str) or marker not in {"opened", "processed"}:
+            return Check(
+                "subsystem.atlas.receipts_complete",
+                "atlas",
+                "not_applicable",
+                "receipt rows do not expose the expected content-free "
+                "bookkeeping shape",
+            )
+        (opened if marker == "opened" else processed).add(key)
+    interrupted = len(opened - processed)
+    if interrupted:
+        return Check(
+            "subsystem.atlas.receipts_complete",
+            "atlas",
+            "warning",
+            f"{interrupted} intake keys have an opened receipt without a "
+            "processed receipt",
+            "Resume or reconcile the interrupted intake explicitly.",
+        )
+    return Check(
+        "subsystem.atlas.receipts_complete",
+        "atlas",
+        "ok",
+        "every opened intake receipt has a matching processed receipt",
+    )
+
+
+def atlas_checks(root: Path | None, show_paths: bool) -> list[Check]:
+    """Keep Atlas findings contiguous while suppressing cascades from bad layout."""
+    layout, usable = _atlas_layout_check(root, show_paths)
+    if not usable:
+        reason = (
+            "Atlas private instance is not configured"
+            if root is None
+            else "Atlas instance layout is not usable"
+        )
+        return [
+            layout,
+            Check("subsystem.atlas.journals_parse", "atlas", "not_applicable", reason),
+            Check("subsystem.atlas.writer_lock", "atlas", "not_applicable", reason),
+            Check(
+                "subsystem.atlas.receipts_complete",
+                "atlas",
+                "not_applicable",
+                reason,
+            ),
+        ]
+    assert root is not None
+    scan = _atlas_journal_scan(root, show_paths)
+    return [layout, scan.check, _atlas_lock_check(root), _atlas_receipts_check(scan)]
+
+
+def _is_within(path: Path, roots: list[Path]) -> bool:
+    """Reject runner candidates from any inspected code or data root."""
+    candidates = {path, path.resolve()}
+    for root in roots:
+        root_candidates = {root, root.resolve()}
+        if any(
+            candidate.is_relative_to(base)
+            for candidate in candidates
+            for base in root_candidates
+        ):
+            return True
+    return False
+
+
+def _safe_runner_path(instance_roots: list[Path]) -> tuple[str, dict[str, Path]]:
+    """Remove repository and instance entries before executable resolution."""
+    forbidden = [ROOT, *instance_roots]
+    entries: list[str] = []
+    for raw in os.get_exec_path():
+        entry = Path(os.path.abspath(raw or os.curdir)).expanduser()
+        if not _is_within(entry, forbidden):
+            entries.append(str(entry))
+    search_path = os.pathsep.join(entries)
+    found: dict[str, Path] = {}
+    for runner in APPROVED_RUNNERS:
+        resolved = shutil.which(runner, path=search_path)
+        if resolved is None:
+            continue
+        candidate = Path(os.path.abspath(resolved))
+        if not _is_within(candidate, forbidden):
+            found[runner] = candidate
+    return search_path, found
+
+
+def _parse_version(runner: str, output: str) -> str | None:
+    """Whitelist a short version line so third-party output cannot leak paths."""
+    line = output.strip()
+    if "\n" in line or "\r" in line or len(line) > 120:
+        return None
+    allowed = re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._+()\-]*", line)
+    if runner not in line.lower() or allowed is None:
+        return None
+    return line
+
+
+def runtime_runner_checks(instance_roots: list[Path]) -> list[Check]:
+    """Treat an entirely absent optional runtime as an absent subject, not damage."""
+    search_path, found = _safe_runner_path(instance_roots)
+    if not found:
+        return [
+            Check(
+                "runtime.runner_present",
+                "selfos",
+                "not_applicable",
+                "no approved agent runner is installed",
+            ),
+            Check(
+                "runtime.runner_version",
+                "selfos",
+                "not_applicable",
+                "no installed runner has a version to check",
+            ),
+        ]
+
+    missing = [runner for runner in APPROVED_RUNNERS if runner not in found]
+    present_detail = "available runners: " + ", ".join(found)
+    if missing:
+        present = Check(
+            "runtime.runner_present",
+            "selfos",
+            "warning",
+            present_detail + "; missing runners: " + ", ".join(missing),
+            "Install a missing runner only if an explicit agent run needs it.",
+        )
+    else:
+        present = Check("runtime.runner_present", "selfos", "ok", present_detail)
+
+    environment = {
+        "PATH": search_path,
+        "LANG": "C",
+        "LC_ALL": "C",
+        "NO_COLOR": "1",
+    }
+    versions: list[str] = []
+    failed = False
+    for runner in APPROVED_RUNNERS:
+        executable = found.get(runner)
+        if executable is None:
+            continue
+        try:
+            result = subprocess.run(
+                (str(executable), "--version"),
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=RUNNER_VERSION_TIMEOUT_SECONDS,
+                env=environment,
+                cwd="/",
+            )
+        except (OSError, subprocess.TimeoutExpired, UnicodeError):
+            failed = True
+            continue
+        parsed = (
+            _parse_version(runner, result.stdout)
+            if result.returncode == 0
+            else None
+        )
+        if parsed is None:
+            failed = True
+        else:
+            versions.append(parsed)
+    detail = "; ".join(versions)
+    if failed:
+        if detail:
+            detail += "; "
+        detail += "one or more installed runner versions could not be verified"
+        version = Check(
+            "runtime.runner_version",
+            "selfos",
+            "warning",
+            detail,
+            "Run the affected executable with --version manually.",
+        )
+    else:
+        version = Check("runtime.runner_version", "selfos", "ok", detail)
+    return [present, version]
+
+
+def runtime_override_check(override_value: str | None, show_paths: bool) -> Check:
+    """Read only the dated marker so the live override body never enters output."""
+    remediation = "Configure runtime.override_path; see docs/model-override.example.md."
+    if override_value is None:
+        return Check(
+            "runtime.override_verified",
+            "selfos",
+            "not_applicable",
+            "no runtime override path is configured",
+            remediation,
+        )
+    path = Path(os.path.abspath(Path(override_value).expanduser()))
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        file_fd = os.open(path, flags)
+        try:
+            info = os.fstat(file_fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024:
+                raise OSError
+            with os.fdopen(file_fd, "rb") as stream:
+                file_fd = -1
+                data = stream.read(64 * 1024 + 1)
+        finally:
+            if file_fd >= 0:
+                os.close(file_fd)
+    except OSError:
+        return Check(
+            "runtime.override_verified",
+            "selfos",
+            "warning",
+            "configured runtime override is missing or unreadable"
+            + path_suffix(path, show_paths),
+            remediation,
+        )
+    if len(data) > 64 * 1024:
+        return Check(
+            "runtime.override_verified",
+            "selfos",
+            "warning",
+            "runtime override marker was not found within the bounded read",
+            remediation,
+        )
+    try:
+        lines = data.decode("utf-8", errors="strict").splitlines()
+    except UnicodeError:
+        lines = []
+    match = next(
+        (
+            VERIFIED_LINE.match(line)
+            for line in lines
+            if VERIFIED_LINE.match(line)
+        ),
+        None,
+    )
+    if match is None:
+        return Check(
+            "runtime.override_verified",
+            "selfos",
+            "warning",
+            "runtime override has no parseable Last verified date",
+            remediation,
+        )
+    rendered_date = match.group(1)
+    try:
+        verified = dt.date.fromisoformat(rendered_date)
+    except ValueError:
+        return Check(
+            "runtime.override_verified",
+            "selfos",
+            "warning",
+            "runtime override has no parseable Last verified date",
+            remediation,
+        )
+    age = (dt.date.today() - verified).days
+    if age < 0 or age > OVERRIDE_RECENT_DAYS:
+        return Check(
+            "runtime.override_verified",
+            "selfos",
+            "warning",
+            f"runtime override was last verified {rendered_date}; age is {age} days",
+            "Re-verify the override against current runner behavior.",
+        )
+    return Check(
+        "runtime.override_verified",
+        "selfos",
+        "ok",
+        f"runtime override was last verified {rendered_date}; age is {age} days",
+    )
+
+
 def collect_checks(show_paths: bool) -> list[Check]:
-    """Collect this slice's checks in stable presentation order."""
+    """Append new groups without disturbing the shipped presentation order."""
     try:
         pins = load_pins()
     except ManifestError as exc:
@@ -471,10 +1515,18 @@ def collect_checks(show_paths: bool) -> list[Check]:
         pin = pins[label] if pins is not None else None
         checks.extend(repo_checks(label, pin, show_paths))
 
-    config_instances = load_config_instances()
+    config_instances, runtime_override = load_user_config()
+    instance_roots: dict[str, Path | None] = {}
     for label in EXPECTED_REPOS:
         root, source = discover_instance(label, config_instances)
+        instance_roots[label] = root
         checks.extend(instance_checks(label, root, source, show_paths))
+
+    checks.extend(ephemeris_checks(instance_roots["ephemeris"], show_paths))
+    checks.extend(atlas_checks(instance_roots["atlas"], show_paths))
+    configured_roots = [root for root in instance_roots.values() if root is not None]
+    checks.extend(runtime_runner_checks(configured_roots))
+    checks.append(runtime_override_check(runtime_override, show_paths))
     return checks
 
 
@@ -531,9 +1583,11 @@ def main() -> int:
     try:
         checks = collect_checks(args.show_paths)
         state = overall_state(checks)
-    except (DoctorInternalError, OSError) as exc:
-        detail = str(exc) if args.show_paths else "local state could not be inspected"
-        print(f"doctor internal error: {detail}", file=sys.stderr)
+    except (DoctorInternalError, OSError):
+        print(
+            "doctor internal error: local state could not be inspected",
+            file=sys.stderr,
+        )
         return 2
 
     if args.json:
