@@ -247,6 +247,38 @@ def test_wal_without_shm_makes_schema_and_integrity_unverified_without_mutation(
         writer.close()
 
 
+def test_unreadable_wal_makes_schema_and_integrity_unverified(
+    isolated_doctor: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_ephemeris_engine(isolated_doctor, 1)
+    root = isolated_doctor.parent / "private-unreadable-wal"
+    database = make_database(root, 1)
+    wal = database.with_name(database.name + "-wal")
+    wal.write_bytes(synthetic_pending_wal())
+    fresh_backup(root)
+    real_open = os.open
+
+    def refuse_wal(path, flags, *args, **kwargs):
+        if Path(path) == wal:
+            raise PermissionError("fixture WAL is unreadable")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(doctor.os, "open", refuse_wal)
+
+    checks = doctor.ephemeris_checks(root, False)
+
+    assert by_id(checks, "subsystem.ephemeris.database_readable").status == "ok"
+    for check_id in (
+        "subsystem.ephemeris.schema_compatible",
+        "subsystem.ephemeris.integrity_check",
+    ):
+        finding = by_id(checks, check_id)
+        assert finding.status == "warning"
+        assert "WAL file could not be inspected" in finding.detail
+        assert "private-unreadable-wal" not in finding.detail
+
+
 def test_junk_wal_does_not_soften_corrupt_main_file_or_mutate_sidecars(
     isolated_doctor: Path,
 ) -> None:
@@ -392,6 +424,22 @@ def test_healthy_database_and_recent_backup_are_ok(isolated_doctor: Path) -> Non
     assert [check.status for check in checks] == ["ok", "ok", "ok", "ok"]
 
 
+def test_unavailable_engine_schema_warns_for_configured_database(
+    isolated_doctor: Path,
+) -> None:
+    root = isolated_doctor.parent / "private-schema-unavailable"
+    make_database(root, 5)
+    fresh_backup(root)
+
+    finding = by_id(
+        doctor.ephemeris_checks(root, False),
+        "subsystem.ephemeris.schema_compatible",
+    )
+
+    assert finding.status == "warning"
+    assert "engine schema version is unavailable" in finding.detail
+
+
 def test_old_or_absent_backup_warns(isolated_doctor: Path) -> None:
     root = isolated_doctor.parent / "private-backup"
     root.mkdir()
@@ -405,6 +453,28 @@ def test_old_or_absent_backup_warns(isolated_doctor: Path) -> None:
     old = time.time() - 9 * 86400
     os.utime(snapshot, (old, old))
     assert doctor._ephemeris_backup_check(root, False).status == "warning"
+
+
+def test_future_backup_timestamp_warns_and_cannot_mask_stale_backup(
+    isolated_doctor: Path,
+) -> None:
+    root = isolated_doctor.parent / "private-future-backup"
+    backups = root / "backups"
+    backups.mkdir(parents=True)
+    stale = backups / "stale.backup"
+    stale.write_bytes(b"")
+    old = time.time() - 9 * 86400
+    os.utime(stale, (old, old))
+    future = backups / "future.backup"
+    future.write_bytes(b"")
+    ahead = time.time() + 86400
+    os.utime(future, (ahead, ahead))
+
+    finding = doctor._ephemeris_backup_check(root, False)
+
+    assert finding.status == "warning"
+    assert "timestamp is in the future" in finding.detail
+    assert "private-future-backup" not in finding.detail
 
 
 def test_backup_freshness_ignores_directories_fifos_and_symlinks(
@@ -590,6 +660,48 @@ def test_processed_receipt_without_prior_opened_is_not_silently_clean(
     assert "1 intake keys" in finding.detail
     assert "without a preceding opened receipt" in finding.detail
     assert "private-orphan-key" not in finding.detail
+
+
+def test_second_processed_receipt_without_unmatched_opened_warns(
+    isolated_doctor: Path,
+) -> None:
+    root = make_atlas(isolated_doctor.parent / "atlas-duplicate-processed")
+    (root / "state" / "receipts.jsonl").write_text(
+        '{"intake":"private-duplicate-key","marker":"opened"}\n'
+        '{"intake":"private-duplicate-key","marker":"processed"}\n'
+        '{"intake":"private-duplicate-key","marker":"processed"}\n',
+        encoding="utf-8",
+    )
+
+    finding = by_id(
+        doctor.atlas_checks(root, False),
+        "subsystem.atlas.receipts_complete",
+    )
+
+    assert finding.status == "warning"
+    assert "without a preceding opened receipt" in finding.detail
+    assert "private-duplicate-key" not in finding.detail
+
+
+def test_duplicate_opened_receipt_is_an_invalid_transition(
+    isolated_doctor: Path,
+) -> None:
+    root = make_atlas(isolated_doctor.parent / "atlas-duplicate-opened")
+    (root / "state" / "receipts.jsonl").write_text(
+        '{"intake":"private-duplicate-key","marker":"opened"}\n'
+        '{"intake":"private-duplicate-key","marker":"opened"}\n'
+        '{"intake":"private-duplicate-key","marker":"processed"}\n',
+        encoding="utf-8",
+    )
+
+    finding = by_id(
+        doctor.atlas_checks(root, False),
+        "subsystem.atlas.receipts_complete",
+    )
+
+    assert finding.status == "warning"
+    assert "invalid receipt transitions" in finding.detail
+    assert "private-duplicate-key" not in finding.detail
 
 
 def test_guessed_receipt_field_names_are_not_applicable(

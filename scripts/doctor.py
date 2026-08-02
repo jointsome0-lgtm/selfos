@@ -84,12 +84,21 @@ class Check:
 
 
 @dataclass(frozen=True)
+class ReceiptState:
+    """The latest marker plus any invalid transition already seen for one key."""
+
+    latest_marker: str
+    invalid_transition: bool = False
+    processed_without_open: bool = False
+
+
+@dataclass(frozen=True)
 class AtlasJournalScan:
     """Carry only bounded folded receipt state after safe journal inspection."""
 
     check: Check
     receipts_present: bool = False
-    receipt_latest: dict[str, tuple[str, bool]] | None = None
+    receipt_latest: dict[str, ReceiptState] | None = None
     receipt_shape_valid: bool = True
 
 
@@ -560,8 +569,8 @@ def _sqlite_is_busy(exc: sqlite3.Error) -> bool:
     return "locked" in lowered or "busy" in lowered
 
 
-def _sqlite_has_pending_wal(wal: Path) -> bool:
-    """Recognize one complete WAL frame through a bounded, nonblocking read."""
+def _sqlite_has_pending_wal(wal: Path) -> bool | None:
+    """Recognize a pending WAL, distinguishing absence from unreadability."""
     flags = os.O_RDONLY
     flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NONBLOCK", 0)
@@ -570,10 +579,12 @@ def _sqlite_has_pending_wal(wal: Path) -> bool:
         file_fd = os.open(wal, flags)
         info = os.fstat(file_fd)
         if not stat.S_ISREG(info.st_mode):
-            return False
+            return None
         header = os.read(file_fd, SQLITE_WAL_HEADER_BYTES)
-    except OSError:
+    except FileNotFoundError:
         return False
+    except OSError:
+        return None
     finally:
         if file_fd is not None:
             os.close(file_fd)
@@ -665,6 +676,14 @@ def _ephemeris_backup_check(root: Path, show_paths: bool) -> Check:
             "warning",
             "no backups are available",
             remediation,
+        )
+    if newest > time.time():
+        return Check(
+            "subsystem.ephemeris.backup_recent",
+            "ephemeris",
+            "warning",
+            "backup recency is unverified because a backup timestamp is in the future",
+            "Check the system clock and backup metadata, then run doctor again.",
         )
     age = _age_days(newest)
     if age > BACKUP_RECENT_DAYS:
@@ -853,6 +872,18 @@ def ephemeris_checks(
 
     wal = database.with_name(database.name + "-wal")
     wal_pending = _sqlite_has_pending_wal(wal)
+    wal_unverified = wal_pending is not False
+    wal_reason = (
+        "the WAL tail is not visible"
+        if wal_pending is True
+        else "the WAL file could not be inspected"
+    )
+    wal_remediation = (
+        "Checkpoint the ledger WAL explicitly, then run doctor again."
+        if wal_pending is True
+        else "Restore readable WAL storage or checkpoint it explicitly, then run "
+        "doctor again."
+    )
     connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(
@@ -909,20 +940,21 @@ def ephemeris_checks(
         + path_suffix(database, show_paths),
     )
     expected_version = _ephemeris_schema_version()
-    if wal_pending:
+    if wal_unverified:
         schema = Check(
             "subsystem.ephemeris.schema_compatible",
             "ephemeris",
             "warning",
-            "schema compatibility is unverified because the WAL tail is not visible",
-            "Checkpoint the ledger WAL explicitly, then run doctor again.",
+            f"schema compatibility is unverified because {wal_reason}",
+            wal_remediation,
         )
     elif expected_version is None:
         schema = Check(
             "subsystem.ephemeris.schema_compatible",
             "ephemeris",
-            "not_applicable",
+            "warning",
             "engine schema version is unavailable from the sibling checkout",
+            "Restore an inspectable ephemeris sibling checkout, then run doctor again.",
         )
     elif actual_version > expected_version:
         schema = Check(
@@ -953,13 +985,13 @@ def ephemeris_checks(
     try:
         quick_rows = connection.execute("PRAGMA quick_check(1)").fetchall()
     except sqlite3.Error as exc:
-        if wal_pending:
+        if wal_unverified:
             integrity = Check(
                 "subsystem.ephemeris.integrity_check",
                 "ephemeris",
                 "warning",
-                "integrity is unverified because the WAL tail is not visible",
-                "Checkpoint the ledger WAL explicitly, then run doctor again.",
+                f"integrity is unverified because {wal_reason}",
+                wal_remediation,
             )
         elif _sqlite_is_busy(exc):
             integrity = Check(
@@ -979,23 +1011,22 @@ def ephemeris_checks(
             )
     else:
         passed = quick_rows == [("ok",)]
-        unverified = wal_pending
-        status = "warning" if unverified else ("ok" if passed else "blocked")
+        status = "warning" if wal_unverified else ("ok" if passed else "blocked")
         integrity = Check(
             "subsystem.ephemeris.integrity_check",
             "ephemeris",
             status,
-            "integrity is unverified because the WAL tail is not visible"
-            if unverified
+            f"integrity is unverified because {wal_reason}"
+            if wal_unverified
             else "database integrity check passed"
             if passed
             else (
                 "database integrity check failed"
             ),
             ""
-            if passed and not unverified
-            else "Checkpoint the ledger WAL explicitly, then run doctor again."
-            if unverified
+            if passed and not wal_unverified
+            else wal_remediation
+            if wal_unverified
             else "Restore the ledger from a known-good backup.",
         )
     finally:
@@ -1237,7 +1268,7 @@ def _atlas_journal_scan(root: Path, show_paths: bool) -> AtlasJournalScan:
             journal_names = journal_names[:ATLAS_MAX_JOURNALS]
 
         receipts_present = receipt_files > 0
-        receipt_latest: dict[str, tuple[str, bool]] = {}
+        receipt_latest: dict[str, ReceiptState] = {}
         receipt_shape_valid = True
         receipt_bytes = 0
         journal_bytes = 0
@@ -1387,10 +1418,25 @@ def _atlas_journal_scan(root: Path, show_paths: bool) -> AtlasJournalScan:
                         receipts_complete = False
                         receipt_budget_exceeded = True
                         break
-                    saw_opened = (previous[1] if previous else False) or (
-                        marker == "opened"
+                    invalid_transition = (
+                        previous.invalid_transition if previous else False
                     )
-                    receipt_latest[key] = (marker, saw_opened)
+                    processed_without_open = (
+                        previous.processed_without_open if previous else False
+                    )
+                    if marker == "opened":
+                        invalid_transition |= previous is not None
+                    else:
+                        missing_open = (
+                            previous is None or previous.latest_marker != "opened"
+                        )
+                        invalid_transition |= missing_open
+                        processed_without_open |= missing_open
+                    receipt_latest[key] = ReceiptState(
+                        marker,
+                        invalid_transition,
+                        processed_without_open,
+                    )
 
         if capped:
             return AtlasJournalScan(
@@ -1492,7 +1538,7 @@ def _atlas_receipts_check(scan: AtlasJournalScan) -> Check:
         )
 
     interrupted = sum(
-        latest == "opened" for latest, _saw_opened in scan.receipt_latest.values()
+        state.latest_marker == "opened" for state in scan.receipt_latest.values()
     )
     if interrupted:
         return Check(
@@ -1504,8 +1550,8 @@ def _atlas_receipts_check(scan: AtlasJournalScan) -> Check:
             "Resume or reconcile the interrupted intake explicitly.",
         )
     orphan_processed = sum(
-        latest == "processed" and not saw_opened
-        for latest, saw_opened in scan.receipt_latest.values()
+        state.processed_without_open
+        for state in scan.receipt_latest.values()
     )
     if orphan_processed:
         return Check(
@@ -1514,6 +1560,17 @@ def _atlas_receipts_check(scan: AtlasJournalScan) -> Check:
             "warning",
             f"{orphan_processed} intake keys have a processed receipt without "
             "a preceding opened receipt",
+            "Reconcile the inconsistent receipt history explicitly.",
+        )
+    invalid_transitions = sum(
+        state.invalid_transition for state in scan.receipt_latest.values()
+    )
+    if invalid_transitions:
+        return Check(
+            "subsystem.atlas.receipts_complete",
+            "atlas",
+            "warning",
+            f"{invalid_transitions} intake keys have invalid receipt transitions",
             "Reconcile the inconsistent receipt history explicitly.",
         )
     return Check(
@@ -1567,12 +1624,17 @@ def atlas_checks(
 def _is_within(path: Path, roots: list[Path]) -> bool:
     """Reject runner candidates from any inspected code or data root."""
     try:
-        candidates = {path, path.resolve()}
+        candidates = {path, path.resolve(strict=True)}
     except (OSError, RuntimeError):
         return True
     for root in roots:
         try:
-            root_candidates = {root, root.resolve()}
+            root_candidates = {root, root.resolve(strict=True)}
+        except FileNotFoundError:
+            try:
+                root_candidates = {root, root.resolve(strict=False)}
+            except (OSError, RuntimeError):
+                return True
         except (OSError, RuntimeError):
             return True
         if any(
