@@ -403,6 +403,19 @@ def load_config_instances() -> dict[str, str]:
     return instances
 
 
+def _configured_instance_path(value: str) -> Path | None:
+    """Build an absolute path while rejecting loops on every supported Python."""
+    try:
+        root = Path(os.path.abspath(Path(value).expanduser()))
+        try:
+            root.resolve(strict=True)
+        except FileNotFoundError:
+            pass
+    except (OSError, RuntimeError):
+        return None
+    return root
+
+
 def discover_instance(
     label: str,
     config_instances: dict[str, str],
@@ -415,17 +428,13 @@ def discover_instance(
     """
     env_var = ENV_VARS[label]
     if value := os.environ.get(env_var):
-        try:
-            root = Path(os.path.abspath(Path(value).expanduser()))
-        except RuntimeError:
-            return None, f"invalid path from environment variable {env_var}"
-        return root, f"environment variable {env_var}"
+        root = _configured_instance_path(value)
+        source = f"environment variable {env_var}"
+        return root, source if root is not None else f"invalid path from {source}"
     if value := config_instances.get(label):
-        try:
-            root = Path(os.path.abspath(Path(value).expanduser()))
-        except RuntimeError:
-            return None, f"invalid path from user config instances.{label}"
-        return root, f"user config instances.{label}"
+        root = _configured_instance_path(value)
+        source = f"user config instances.{label}"
+        return root, source if root is not None else f"invalid path from {source}"
     return None, ""
 
 
@@ -851,7 +860,10 @@ def ephemeris_checks(
     else:
         try:
             effective_database = database.resolve(strict=True)
-            database_is_regular = stat.S_ISREG(effective_database.stat().st_mode)
+            database_info = effective_database.stat()
+            database_is_regular = (
+                stat.S_ISREG(database_info.st_mode) and database_info.st_size > 0
+            )
         except (OSError, RuntimeError):
             database_is_regular = False
 
@@ -1847,6 +1859,19 @@ def runtime_override_check(override_value: str | None, show_paths: bool) -> Chec
             "warning",
             "configured runtime override is missing or unreadable",
             remediation,
+        )
+    try:
+        public_label = containing_public_root(path)
+    except (OSError, RuntimeError):
+        public_label = None
+    if public_label is not None:
+        return Check(
+            "runtime.override_verified",
+            "selfos",
+            "warning",
+            "configured runtime override points inside a public checkout"
+            + path_suffix(path, show_paths),
+            "Copy the example to a user-scoped private path and configure that path.",
         )
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NONBLOCK", 0)

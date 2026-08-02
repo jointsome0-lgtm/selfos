@@ -97,6 +97,29 @@ def test_corrupt_database_is_blocked_without_creating_sidecars(
     assert not Path(str(database) + "-shm").exists()
 
 
+def test_zero_byte_database_is_blocked_as_unreadable(
+    isolated_doctor: Path,
+) -> None:
+    root = isolated_doctor.parent / "private-empty-ledger"
+    root.mkdir()
+    database = root / "activity.sqlite"
+    database.write_bytes(b"")
+    fresh_backup(root)
+
+    checks = doctor.ephemeris_checks(root, False)
+
+    assert by_id(checks, "subsystem.ephemeris.database_readable").status == "blocked"
+    assert by_id(checks, "subsystem.ephemeris.schema_compatible").status == (
+        "not_applicable"
+    )
+    assert by_id(checks, "subsystem.ephemeris.integrity_check").status == (
+        "not_applicable"
+    )
+    assert database.stat().st_size == 0
+    assert not database.with_name(database.name + "-wal").exists()
+    assert not database.with_name(database.name + "-shm").exists()
+
+
 def test_unopenable_database_error_is_summarised_without_path(
     isolated_doctor: Path, monkeypatch
 ) -> None:

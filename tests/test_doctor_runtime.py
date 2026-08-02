@@ -141,6 +141,23 @@ def test_unknown_user_override_path_warns_without_expansion_crash() -> None:
     assert "missing-user" not in finding.detail
 
 
+def test_public_example_cannot_masquerade_as_live_override(
+    isolated_doctor: Path,
+) -> None:
+    example = isolated_doctor / "docs" / "model-override.example.md"
+    example.parent.mkdir()
+    example.write_text(
+        "Vera Example\nLast verified: 2026-08-02 (snapshot)\n",
+        encoding="utf-8",
+    )
+
+    finding = doctor.runtime_override_check(str(example), False)
+
+    assert finding.status == "warning"
+    assert "inside a public checkout" in finding.detail
+    assert "model-override.example.md" not in finding.detail
+
+
 def test_override_fifo_without_writer_is_rejected_without_blocking(
     isolated_doctor: Path,
 ) -> None:

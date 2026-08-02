@@ -138,3 +138,31 @@ def test_unknown_user_instance_path_is_reported_without_expansion_crash(
     assert check_by_id(checks, "instance.root_outside_public").status == (
         "not_applicable"
     )
+
+
+def test_looping_configured_root_is_reported_without_aborting_other_checks(
+    isolated_doctor: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = isolated_doctor.parent / "instance-loop-first"
+    second = isolated_doctor.parent / "instance-loop-second"
+    first.symlink_to(second)
+    second.symlink_to(first)
+    monkeypatch.setenv("ATLAS_INSTANCE", str(first))
+
+    checks = doctor.collect_checks(False)
+
+    configured = next(
+        check
+        for check in checks
+        if check.id == "instance.root_configured" and check.label == "atlas"
+    )
+    outside = next(
+        check
+        for check in checks
+        if check.id == "instance.root_outside_public" and check.label == "atlas"
+    )
+    assert configured.status == "warning"
+    assert "invalid or unreadable" in configured.detail
+    assert outside.status == "not_applicable"
+    assert any(check.label != "atlas" for check in checks)
