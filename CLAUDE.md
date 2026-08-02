@@ -6,83 +6,69 @@ model and its data boundaries, current stage, public-data policy) and applies
 to Claude Code in full. The public shape of the ecosystem lives in
 [README.md](README.md).
 
-## Security reviews go to Codex
+## Security reviews go to an independent external reviewer
 
-Claude-only rule — the reason is Fable-specific, and in AGENTS.md it would just tell Codex to delegate to itself. Ecosystem-wide; the full version lives in ephemeris's CLAUDE.md.
+Claude-only rule — in AGENTS.md it would just tell the reviewer to
+delegate to itself. Ecosystem-wide; the full version lives in
+ephemeris's CLAUDE.md.
 
-Adversarial security / threat-model reviews — of cross-system contracts, integration surfaces, or any subsystem code — are **delegated to Codex** (a direct `codex exec` with a self-contained prompt), not run by Claude in the first person.
+Adversarial security / threat-model reviews — of cross-system
+contracts, integration surfaces, or any subsystem code — are
+**delegated to an independent external reviewer**: a different
+vendor's agent CLI driven by a self-contained prompt (current tool
+and model: dated local override). Never run by Claude in the first
+person.
 
-- Reason, so nobody "fixes" this later: Fable's dual-use safeguards are documented (anthropic.com, Fable 5 announcement) to fall back to Claude Opus 4.8 on cybersecurity framing — a first-person adversarial pass can silently switch models and drop the thread mid-task. Codex is unaffected and gives a genuinely independent adversarial view.
-- Claude's role is the correctness half (consistency, invariants, plan alignment) and converging Codex's findings with its own.
-- Routing rule, not a license to ignore security: a concern noticed in passing still gets surfaced plainly — the adversarial probing is what goes to Codex.
+- Durable reason, so nobody "fixes" this later: (1) independence —
+  an adversarial pass from a second, unaffiliated toolchain is
+  evidence the author's own harness cannot produce about itself;
+  (2) continuity — assistant-side dual-use safeguards can reroute
+  or switch models mid-task on security framing, silently dropping
+  the thread. Dated instance (2026-07): Fable's safeguards are
+  documented (anthropic.com, Fable 5 announcement) to fall back to
+  Claude Opus 4.8 on cybersecurity framing; the Codex CLI is
+  unaffected.
+- Claude's role is the correctness half (consistency, invariants,
+  plan alignment) and converging the external reviewer's findings
+  with its own.
+- Routing rule, not a license to ignore security: a concern noticed
+  in passing still gets surfaced plainly — the adversarial probing
+  is what goes to the external reviewer.
 
-## Picking the right models for workflows and subagents
+## Picking models for workflows and subagents
 
-Rankings, higher = better. Cost reflects what I actually pay (OpenAI has really
-generous limits), not list price. Intelligence is how hard a problem you can
-hand the model unsupervised. Taste covers UI/UX, code quality, API design, and
-copy.
+Route by capability, not by name. The current model roster — names,
+rankings, harness mechanics, effort defaults, fallback order,
+last-verified date — lives in the dated local override (user-scope
+~/.claude/CLAUDE.md; bootstrap example:
+docs/model-override.example.md). This section stays valid when
+every alias changes.
 
-| model    | cost | intelligence | taste |
-|----------|------|--------------|-------|
-| gpt-5.6  | 9    | 8.9          | 7     |
-| sonnet-5 | 5    | 5            | 7     |
-| opus-5   | 3    | 8.5          | 8.5   |
-| fable-5  | 2    | 9            | 9     |
+Capability axes (match task shape to the roster's current best fit):
 
-How to apply:
+- bulk/mechanical work with a clear spec;
+- architecture & interconnection review;
+- independent defect finding (critic);
+- user-facing taste: UI, copy, API design;
+- adversarial security review → independent external reviewer (see
+  section above);
+- unsupervised autonomy needs intelligence headroom, not just skill
+  match.
 
-- These are defaults, not limits. You have standing permission to override
-  them: if a cheaper model's output doesn't meet the bar, rerun or redo the
-  work with a smarter model without asking. Judge the output, not the price
-  tag. Escalating costs less than shipping mediocre work.
-- Cost is a tie-breaker only; when axes conflict for anything that ships,
-  intelligence > taste > cost.
-- The top two split by shape, not rank: fable-5 is stronger on architecture
-  and interconnections; gpt-5.6 on driving a goal to completion and finding
-  defects. Pick by task shape, not the raw intelligence number.
-- Bulk/mechanical work (clear-spec implementation, data analysis, migrations):
-  gpt-5.6 — it's effectively free.
-- Anything user-facing (UI, copy, API design) needs taste ≥ 7.
-- Reviews of plans/implementations: fable-5 or opus-5, optionally gpt-5.6 as
-  an extra independent perspective.
-- Fallback when Fable limits run out: fable-5 → opus-5 → gpt-5.6. Never use
-  Haiku. When gpt-5.6 held the pen, independent review of that work goes to a
-  Claude session (fable-5, otherwise opus-5); degrading never weakens review
-  independence.
-- Mechanics: gpt-5.6 is only reachable through the Codex CLI — `codex exec` /
-  `codex review` (my `~/.codex/config.toml` defaults to `gpt-5.6-sol` at xhigh
-  effort). Always run `codex exec` directly via Bash
-  with a self-contained prompt you wrote: `-s read-only` for pure
-  reading/analysis; `-s workspace-write` when it must edit files OR run
-  tests/builds — test runs write caches and temp state, so read-only makes
-  them fail or stall (this produced a false "verify.py hangs" finding once).
-  Health check: `codex --version` plus a trivial exec.
-- Effort sizing (2026-07-19): the xhigh config default is for full
-  adversarial/design passes only — open-ended search where a missed
-  defect costs more than the hours. Scoped real work — implementing
-  from a clear spec, diagnosing a named bug, reviewing a medium diff,
-  prep/measurement tasks — gets `-c model_reasoning_effort=high`.
-  Routine bounded checks — verifying a small diff, fidelity/gate
-  checks, health checks — medium; trivial/relay: low (atlas
-  2026-07-19: xhigh on a 42-line verify diff burned ~10x wall-time
-  for no extra findings).
-- Parallel codex execs are fragile (atlas 2026-07-16: an exec hung
-  ~35 min behind parallel sessions) — prefer one lighter run over a
-  fan-out; whole-diff consistency doesn't decompose per-finding.
-- Claude models (sonnet-5, opus-5, fable-5) run via the Agent/Workflow model
-  parameter.
+Standing rules, model-independent:
 
-Using gpt-5.6 inside workflows and subagents (the model parameter only takes
-Claude models, so use a wrapper):
-
-- Spawn a thin Claude wrapper agent with `model: 'sonnet', effort: 'low'` whose
-  only job is to run `codex exec` via Bash and return the raw output verbatim.
-- Write the full self-contained codex prompt yourself and pass it to the
-  wrapper word-for-word. Wrappers never formulate or rewrite codex prompts —
-  sonnet/opus don't write them well, and intermediary layers are banned — and
-  you digest the result yourself.
-- Treat codex claims (file:line, "tests are green", "done") as unverified until
-  checked against artifacts. Codex is goal-driven and loves finding defects —
-  excellent as a critic, so on long solo work call it at checkpoints
-  (draft/diff → its findings → improve), not only at the end.
+- Judge the output, not the price: escalate without asking when a
+  cheaper model's output misses the bar. Intelligence > taste >
+  cost for anything that ships; cost is a tie-breaker only.
+- Respect the override's capability floor — never delegate below it.
+- When a preferred model is unavailable, degrade along the
+  override's fallback order — never below the floor, and never by
+  weakening review independence or widening data access.
+- Delegated claims (file:line, "tests are green", "done") are
+  unverified until checked against artifacts.
+- Write delegate prompts yourself: outcome-first, self-contained.
+  Relay wrappers pass them verbatim — never reformulate; no
+  intermediary layers.
+- On long solo work, call an independent critic at checkpoints, not
+  only at the end.
+- Review output states the selected runtime and the override's date.
