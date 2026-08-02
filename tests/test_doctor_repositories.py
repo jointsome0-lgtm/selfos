@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from scripts import doctor
 
 from conftest import run_git
@@ -72,3 +74,67 @@ def test_instances_loader_keeps_runtime_separate(
     monkeypatch.setattr(doctor, "CONFIG_PATH", config)
     assert doctor.load_config_instances() == {"atlas": "/tmp/vera-atlas"}
     assert doctor.load_user_config()[1] == "/tmp/vera-override"
+
+
+def test_rejected_public_roots_make_all_subsystem_checks_not_applicable(
+    isolated_doctor: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ephemeris_root = isolated_doctor / "rejected-ephemeris-instance"
+    atlas_root = isolated_doctor / "rejected-atlas-instance"
+    monkeypatch.setenv("ACTIVITY_DATA_DIR", str(ephemeris_root))
+    monkeypatch.setenv("ATLAS_INSTANCE", str(atlas_root))
+
+    def reject_inspection(*_args, **_kwargs):
+        pytest.fail("a rejected public root must not be inspected")
+
+    original_lstat = Path.lstat
+
+    def guarded_lstat(path, *args, **kwargs):
+        if any(path.is_relative_to(root) for root in (ephemeris_root, atlas_root)):
+            pytest.fail("a rejected public root must not be stat-walked")
+        return original_lstat(path, *args, **kwargs)
+
+    def safe_runner_path(roots):
+        assert ephemeris_root not in roots
+        assert atlas_root not in roots
+        return "", {}
+
+    monkeypatch.setattr(Path, "lstat", guarded_lstat)
+    monkeypatch.setattr(doctor.sqlite3, "connect", reject_inspection)
+    monkeypatch.setattr(doctor, "_open_directory_no_follow", reject_inspection)
+    monkeypatch.setattr(doctor, "_safe_runner_path", safe_runner_path)
+    checks = doctor.collect_checks(False)
+
+    for label in ("ephemeris", "atlas"):
+        containment = next(
+            check
+            for check in checks
+            if check.id == "instance.root_outside_public" and check.label == label
+        )
+        assert containment.status == "blocked"
+        subsystem = [
+            check
+            for check in checks
+            if check.label == label and check.id.startswith("subsystem.")
+        ]
+        assert subsystem
+        assert {check.status for check in subsystem} == {"not_applicable"}
+        assert all(
+            "inspection is refused across the public-instance boundary"
+            in check.detail
+            for check in subsystem
+        )
+
+
+def test_unknown_user_instance_path_is_reported_without_expansion_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ACTIVITY_DATA_DIR", "~missing-user/data")
+    root, source = doctor.discover_instance("ephemeris", {})
+    assert root is None
+    checks = doctor.instance_checks("ephemeris", root, source, False)
+    assert check_by_id(checks, "instance.root_configured").status == "warning"
+    assert check_by_id(checks, "instance.root_outside_public").status == (
+        "not_applicable"
+    )

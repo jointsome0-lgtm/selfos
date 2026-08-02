@@ -8,8 +8,10 @@ subsystems together, private roots are discovered from each subsystem
 environment variable and then ``~/.config/selfos/config.toml``; doctor has no
 per-subsystem ``--instance`` flag. Requires Python 3.11+ (tomllib).
 
-SQLite inspection uses an immutable read-only view: it never creates WAL/SHM
-sidecars, but it sees only the committed main database file, not the WAL tail.
+SQLite inspection selects a read-only view from existing sidecars. When both
+WAL and SHM already exist, ordinary read-only mode includes the WAL tail;
+otherwise immutable read-only mode avoids creating sidecars and any real WAL
+tail makes schema and integrity results explicitly unverified.
 """
 
 from __future__ import annotations
@@ -18,8 +20,10 @@ import argparse
 import datetime as dt
 import functools
 import json
+import math
 import os
 import re
+import select
 import shutil
 import sqlite3
 import stat
@@ -48,6 +52,8 @@ APPROVED_RUNNERS = ("codex", "claude")
 BACKUP_RECENT_DAYS = 7
 OVERRIDE_RECENT_DAYS = 90
 RUNNER_VERSION_TIMEOUT_SECONDS = 3
+RUNNER_VERSION_MAX_BYTES = 4 * 1024
+SQLITE_WAL_HEADER_BYTES = 32
 ATLAS_MAX_STATE_ENTRIES = 1024
 ATLAS_MAX_JOURNALS = 256
 ATLAS_MAX_JOURNAL_BYTES = 8 * 1024 * 1024
@@ -396,13 +402,17 @@ def discover_instance(
     """
     env_var = ENV_VARS[label]
     if value := os.environ.get(env_var):
-        return Path(os.path.abspath(Path(value).expanduser())), (
-            f"environment variable {env_var}"
-        )
+        try:
+            root = Path(os.path.abspath(Path(value).expanduser()))
+        except RuntimeError:
+            return None, f"invalid path from environment variable {env_var}"
+        return root, f"environment variable {env_var}"
     if value := config_instances.get(label):
-        return Path(os.path.abspath(Path(value).expanduser())), (
-            f"user config instances.{label}"
-        )
+        try:
+            root = Path(os.path.abspath(Path(value).expanduser()))
+        except RuntimeError:
+            return None, f"invalid path from user config instances.{label}"
+        return root, f"user config instances.{label}"
     return None, ""
 
 
@@ -430,6 +440,8 @@ def instance_checks(
     root: Path | None,
     source: str,
     show_paths: bool,
+    public_label: str | None = None,
+    containment_checked: bool = False,
 ) -> list[Check]:
     """Build the two stable private-root checks for one subsystem."""
     env_var = ENV_VARS[label]
@@ -437,6 +449,22 @@ def instance_checks(
         f"Set {env_var} or user config instances.{label}; see docs/instance.md."
     )
     if root is None:
+        if source:
+            return [
+                Check(
+                    "instance.root_configured",
+                    label,
+                    "warning",
+                    "configured private root path is invalid or unreadable",
+                    remediation,
+                ),
+                Check(
+                    "instance.root_outside_public",
+                    label,
+                    "not_applicable",
+                    "public-checkout containment cannot be checked for an invalid path",
+                ),
+            ]
         return [
             Check(
                 "instance.root_configured",
@@ -462,7 +490,8 @@ def instance_checks(
             + path_suffix(root, show_paths),
         )
     ]
-    public_label = containing_public_root(root)
+    if not containment_checked:
+        public_label = containing_public_root(root)
     if public_label is None:
         checks.append(
             Check(
@@ -526,6 +555,15 @@ def _sqlite_is_busy(exc: sqlite3.Error) -> bool:
         return True
     lowered = str(exc).lower()
     return "locked" in lowered or "busy" in lowered
+
+
+def _sqlite_read_only_sidecar_failure(exc: sqlite3.Error) -> bool:
+    """Recognize WAL recovery/open failures that read-only mode cannot repair."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    return isinstance(code, int) and (code & 0xFF) in {
+        sqlite3.SQLITE_READONLY,
+        sqlite3.SQLITE_CANTOPEN,
+    }
 
 
 def _ephemeris_schema_version() -> int | None:
@@ -619,8 +657,23 @@ def _ephemeris_backup_check(root: Path, show_paths: bool) -> Check:
     )
 
 
-def ephemeris_checks(root: Path | None, show_paths: bool) -> list[Check]:
+def ephemeris_checks(
+    root: Path | None,
+    show_paths: bool,
+    root_accepted: bool = True,
+) -> list[Check]:
     """Keep one read-only connection so the three database views agree."""
+    if not root_accepted:
+        reason = "inspection is refused across the public-instance boundary"
+        return [
+            Check(check_id, "ephemeris", "not_applicable", reason)
+            for check_id in (
+                "subsystem.ephemeris.database_readable",
+                "subsystem.ephemeris.schema_compatible",
+                "subsystem.ephemeris.integrity_check",
+                "subsystem.ephemeris.backup_recent",
+            )
+        ]
     if root is None:
         reason = "ephemeris private root is not configured"
         return [
@@ -651,11 +704,36 @@ def ephemeris_checks(root: Path | None, show_paths: bool) -> list[Check]:
         ]
 
     override = os.environ.get("ACTIVITY_DB")
-    database = (
-        Path(os.path.abspath(Path(override).expanduser()))
-        if override
-        else root / "activity.sqlite"
-    )
+    try:
+        database = (
+            Path(os.path.abspath(Path(override).expanduser()))
+            if override
+            else root / "activity.sqlite"
+        )
+    except RuntimeError:
+        reason = "configured ledger database path is invalid or unreadable"
+        return [
+            Check(
+                "subsystem.ephemeris.database_readable",
+                "ephemeris",
+                "blocked",
+                reason,
+                "Restore a valid ledger path; doctor will not repair it.",
+            ),
+            Check(
+                "subsystem.ephemeris.schema_compatible",
+                "ephemeris",
+                "not_applicable",
+                "schema cannot be checked because the database path is invalid",
+            ),
+            Check(
+                "subsystem.ephemeris.integrity_check",
+                "ephemeris",
+                "not_applicable",
+                "integrity cannot be checked because the database path is invalid",
+            ),
+            _ephemeris_backup_check(root, show_paths),
+        ]
     # Ephemeris deliberately permits ACTIVITY_DB to be a free-standing path;
     # app/settings.py uses <data_dir>/activity.sqlite only as its unset default.
     # Requiring containment under ACTIVITY_DATA_DIR would reject supported,
@@ -741,10 +819,32 @@ def ephemeris_checks(root: Path | None, show_paths: bool) -> list[Check]:
             _ephemeris_backup_check(root, show_paths),
         ]
 
+    wal = database.with_name(database.name + "-wal")
+    shm = database.with_name(database.name + "-shm")
+    try:
+        wal_info = wal.lstat()
+    except OSError:
+        wal_exists = False
+        wal_pending = False
+    else:
+        wal_exists = True
+        wal_pending = (
+            stat.S_ISREG(wal_info.st_mode)
+            and wal_info.st_size >= SQLITE_WAL_HEADER_BYTES
+        )
+    try:
+        shm.lstat()
+    except OSError:
+        shm_exists = False
+    else:
+        shm_exists = True
+
+    wal_visible = wal_exists and shm_exists
+    query = "?mode=ro" if wal_visible else "?mode=ro&immutable=1"
     connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(
-            database.absolute().as_uri() + "?mode=ro&immutable=1",
+            database.absolute().as_uri() + query,
             uri=True,
             timeout=0.2,
         )
@@ -753,21 +853,27 @@ def ephemeris_checks(root: Path | None, show_paths: bool) -> list[Check]:
             raise sqlite3.DatabaseError("invalid user_version result")
         actual_version = row[0]
     except sqlite3.Error as exc:
+        sidecar_failure = wal_visible and _sqlite_read_only_sidecar_failure(exc)
         transient = _sqlite_is_busy(exc)
-        status = "warning" if transient else "blocked"
-        detail = (
-            "ledger database could not be checked now"
-            if transient
-            else "ledger database is present but cannot be opened read-only"
-        )
+        status = "warning" if sidecar_failure or transient else "blocked"
+        if sidecar_failure:
+            detail = "ledger could not be inspected without writing"
+        elif transient:
+            detail = "ledger database could not be checked now"
+        else:
+            detail = "ledger database is present but cannot be opened read-only"
         readability = Check(
             "subsystem.ephemeris.database_readable",
             "ephemeris",
             status,
             detail + path_suffix(database, show_paths),
-            "Try again after the active database operation finishes."
-            if transient
-            else "Restore a readable SQLite ledger; doctor will not repair it.",
+            (
+                "Recover or checkpoint the ledger explicitly before retrying."
+                if sidecar_failure
+                else "Try again after the active database operation finishes."
+                if transient
+                else "Restore a readable SQLite ledger; doctor will not repair it."
+            ),
         )
         if connection is not None:
             connection.close()
@@ -792,12 +898,24 @@ def ephemeris_checks(root: Path | None, show_paths: bool) -> list[Check]:
         "subsystem.ephemeris.database_readable",
         "ephemeris",
         "ok",
-        "ledger database opens through an immutable read-only SQLite connection; "
-        "pending WAL writes are not visible"
+        (
+            "ledger database opens read-only with its existing WAL tail visible"
+            if wal_visible
+            else "ledger database opens through an immutable read-only SQLite "
+            "connection"
+        )
         + path_suffix(database, show_paths),
     )
     expected_version = _ephemeris_schema_version()
-    if expected_version is None:
+    if wal_pending and not wal_visible:
+        schema = Check(
+            "subsystem.ephemeris.schema_compatible",
+            "ephemeris",
+            "warning",
+            "schema compatibility is unverified because the WAL tail is not visible",
+            "Checkpoint the ledger WAL explicitly, then run doctor again.",
+        )
+    elif expected_version is None:
         schema = Check(
             "subsystem.ephemeris.schema_compatible",
             "ephemeris",
@@ -830,22 +948,25 @@ def ephemeris_checks(root: Path | None, show_paths: bool) -> list[Check]:
             f"database and engine schema versions match at {actual_version}",
         )
 
-    try:
-        wal_info = database.with_name(database.name + "-wal").lstat()
-        wal_pending = stat.S_ISREG(wal_info.st_mode)
-    except OSError:
-        wal_pending = False
-
+    sidecar_refused = False
     try:
         quick_rows = connection.execute("PRAGMA quick_check(1)").fetchall()
     except sqlite3.Error as exc:
-        if wal_pending:
+        if wal_visible and _sqlite_read_only_sidecar_failure(exc):
+            sidecar_refused = True
+            integrity = Check(
+                "subsystem.ephemeris.integrity_check",
+                "ephemeris",
+                "not_applicable",
+                "integrity cannot be checked without writing",
+            )
+        elif wal_pending and not wal_visible:
             integrity = Check(
                 "subsystem.ephemeris.integrity_check",
                 "ephemeris",
                 "warning",
-                "integrity could not be verified while writes are pending",
-                "Try again after the ledger WAL has been checkpointed.",
+                "integrity is unverified because the WAL tail is not visible",
+                "Checkpoint the ledger WAL explicitly, then run doctor again.",
             )
         elif _sqlite_is_busy(exc):
             integrity = Check(
@@ -865,28 +986,46 @@ def ephemeris_checks(root: Path | None, show_paths: bool) -> list[Check]:
             )
     else:
         passed = quick_rows == [("ok",)]
-        status = "ok" if passed else ("warning" if wal_pending else "blocked")
+        unverified = wal_pending and not wal_visible
+        status = "warning" if unverified else ("ok" if passed else "blocked")
         integrity = Check(
             "subsystem.ephemeris.integrity_check",
             "ephemeris",
             status,
-            "database integrity check passed"
+            "integrity is unverified because the WAL tail is not visible"
+            if unverified
+            else "database integrity check passed"
             if passed
             else (
-                "integrity could not be verified while writes are pending"
-                if wal_pending
-                else "database integrity check failed"
+                "database integrity check failed"
             ),
             ""
-            if passed
-            else (
-                "Try again after the ledger WAL has been checkpointed."
-                if wal_pending
-                else "Restore the ledger from a known-good backup."
-            ),
+            if passed and not unverified
+            else "Checkpoint the ledger WAL explicitly, then run doctor again."
+            if unverified
+            else "Restore the ledger from a known-good backup.",
         )
     finally:
         connection.close()
+    if sidecar_refused:
+        return [
+            Check(
+                "subsystem.ephemeris.database_readable",
+                "ephemeris",
+                "warning",
+                "ledger could not be inspected without writing"
+                + path_suffix(database, show_paths),
+                "Recover or checkpoint the ledger explicitly before retrying.",
+            ),
+            Check(
+                "subsystem.ephemeris.schema_compatible",
+                "ephemeris",
+                "not_applicable",
+                "schema cannot be checked without writing",
+            ),
+            integrity,
+            _ephemeris_backup_check(root, show_paths),
+        ]
     return [readability, schema, integrity, _ephemeris_backup_check(root, show_paths)]
 
 
@@ -910,10 +1049,18 @@ def _strict_json_loads(text: str) -> object:
         """Keep non-standard numeric constants out of strict JSON."""
         raise ValueError("non-finite number")
 
+    def finite_float(value: str) -> float:
+        """Reject standard numeric tokens whose conversion overflows to infinity."""
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError("non-finite number")
+        return parsed
+
     return json.loads(
         text,
         object_pairs_hook=unique_object,
         parse_constant=finite_number,
+        parse_float=finite_float,
     )
 
 
@@ -1358,8 +1505,23 @@ def _atlas_receipts_check(scan: AtlasJournalScan) -> Check:
     )
 
 
-def atlas_checks(root: Path | None, show_paths: bool) -> list[Check]:
+def atlas_checks(
+    root: Path | None,
+    show_paths: bool,
+    root_accepted: bool = True,
+) -> list[Check]:
     """Keep Atlas findings contiguous while suppressing cascades from bad layout."""
+    if not root_accepted:
+        reason = "inspection is refused across the public-instance boundary"
+        return [
+            Check(check_id, "atlas", "not_applicable", reason)
+            for check_id in (
+                "subsystem.atlas.instance_layout",
+                "subsystem.atlas.journals_parse",
+                "subsystem.atlas.writer_lock",
+                "subsystem.atlas.receipts_complete",
+            )
+        ]
     layout, usable = _atlas_layout_check(root, show_paths)
     if not usable:
         reason = (
@@ -1406,7 +1568,10 @@ def _safe_runner_path(instance_roots: list[Path]) -> tuple[str, dict[str, Path]]
     ]
     entries: list[str] = []
     for raw in os.get_exec_path():
-        entry = Path(os.path.abspath(raw or os.curdir)).expanduser()
+        try:
+            entry = Path(os.path.abspath(raw or os.curdir)).expanduser()
+        except RuntimeError:
+            continue
         if not _is_within(entry, forbidden):
             entries.append(str(entry))
     search_path = os.pathsep.join(entries)
@@ -1430,6 +1595,62 @@ def _parse_version(runner: str, output: str) -> str | None:
     if runner not in line.lower() or allowed is None:
         return None
     return line
+
+
+def _bounded_runner_version(
+    executable: Path,
+    environment: dict[str, str],
+) -> tuple[int, str] | None:
+    """Read one bounded version prefix and always reap the runner process."""
+    process = subprocess.Popen(
+        (str(executable), "--version"),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=environment,
+        cwd="/",
+    )
+    assert process.stdout is not None
+    output = bytearray()
+    deadline = time.monotonic() + RUNNER_VERSION_TIMEOUT_SECONDS
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            ready, _, _ = select.select([process.stdout], [], [], remaining)
+            if not ready:
+                return None
+            chunk = os.read(
+                process.stdout.fileno(),
+                min(4096, RUNNER_VERSION_MAX_BYTES + 1 - len(output)),
+            )
+            if not chunk:
+                try:
+                    return_code = process.wait(
+                        timeout=max(0.0, deadline - time.monotonic())
+                    )
+                except subprocess.TimeoutExpired:
+                    return None
+                return return_code, output.decode("utf-8", errors="strict")
+            output.extend(chunk)
+            if len(output) > RUNNER_VERSION_MAX_BYTES:
+                return None
+    finally:
+        process.stdout.close()
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        process.wait()
 
 
 def runtime_runner_checks(instance_roots: list[Path]) -> list[Check]:
@@ -1477,23 +1698,13 @@ def runtime_runner_checks(instance_roots: list[Path]) -> list[Check]:
         if executable is None:
             continue
         try:
-            result = subprocess.run(
-                (str(executable), "--version"),
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=RUNNER_VERSION_TIMEOUT_SECONDS,
-                env=environment,
-                cwd="/",
-            )
+            result = _bounded_runner_version(executable, environment)
         except (OSError, subprocess.TimeoutExpired, UnicodeError):
             failed = True
             continue
         parsed = (
-            _parse_version(runner, result.stdout)
-            if result.returncode == 0
+            _parse_version(runner, result[1])
+            if result is not None and result[0] == 0
             else None
         )
         if parsed is None:
@@ -1528,7 +1739,16 @@ def runtime_override_check(override_value: str | None, show_paths: bool) -> Chec
             "no runtime override path is configured",
             remediation,
         )
-    path = Path(os.path.abspath(Path(override_value).expanduser()))
+    try:
+        path = Path(os.path.abspath(Path(override_value).expanduser()))
+    except RuntimeError:
+        return Check(
+            "runtime.override_verified",
+            "selfos",
+            "warning",
+            "configured runtime override is missing or unreadable",
+            remediation,
+        )
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         file_fd = os.open(path, flags)
@@ -1635,14 +1855,37 @@ def collect_checks(show_paths: bool) -> list[Check]:
 
     config_instances, runtime_override = load_user_config()
     instance_roots: dict[str, Path | None] = {}
+    root_accepted: dict[str, bool] = {}
     for label in EXPECTED_REPOS:
         root, source = discover_instance(label, config_instances)
         instance_roots[label] = root
-        checks.extend(instance_checks(label, root, source, show_paths))
+        public_label = containing_public_root(root) if root is not None else None
+        accepted = root is None or public_label is None
+        root_accepted[label] = accepted
+        checks.extend(
+            instance_checks(
+                label,
+                root,
+                source,
+                show_paths,
+                public_label,
+                containment_checked=True,
+            )
+        )
 
-    checks.extend(ephemeris_checks(instance_roots["ephemeris"], show_paths))
-    checks.extend(atlas_checks(instance_roots["atlas"], show_paths))
-    configured_roots = [root for root in instance_roots.values() if root is not None]
+    checks.extend(
+        ephemeris_checks(
+            instance_roots["ephemeris"], show_paths, root_accepted["ephemeris"]
+        )
+    )
+    checks.extend(
+        atlas_checks(instance_roots["atlas"], show_paths, root_accepted["atlas"])
+    )
+    configured_roots = [
+        root
+        for label, root in instance_roots.items()
+        if root is not None and root_accepted[label]
+    ]
     checks.extend(runtime_runner_checks(configured_roots))
     checks.append(runtime_override_check(runtime_override, show_paths))
     return checks
@@ -1701,7 +1944,7 @@ def main() -> int:
     try:
         checks = collect_checks(args.show_paths)
         state = overall_state(checks)
-    except (DoctorInternalError, OSError):
+    except (DoctorInternalError, OSError, RuntimeError):
         print(
             "doctor internal error: local state could not be inspected",
             file=sys.stderr,

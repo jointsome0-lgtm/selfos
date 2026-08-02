@@ -65,6 +65,24 @@ def test_not_applicable_does_not_change_overall_and_only_blocked_exits_nonzero(
         assert doctor.main() == expected
 
 
+def test_main_catches_runtime_error_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(
+        doctor,
+        "collect_checks",
+        lambda _show: (_ for _ in ()).throw(RuntimeError("private config value")),
+    )
+    monkeypatch.setattr(sys, "argv", ["doctor.py", "--json"])
+    assert doctor.main() == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "doctor internal error: local state could not be inspected\n"
+    assert "Traceback" not in captured.err
+    assert "private config value" not in captured.err
+
+
 def test_json_envelope_and_stable_order(
     isolated_doctor: Path, write_pins, capsys
 ) -> None:

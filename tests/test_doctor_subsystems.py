@@ -106,14 +106,16 @@ def test_busy_database_does_not_block_immutable_inspection(
     assert readable.status != "blocked"
 
 
-def test_wal_database_inspection_creates_no_sidecar_or_directory_entry(
+def test_wal_and_shm_make_schema_and_integrity_authoritative_without_mutation(
     isolated_doctor: Path,
 ) -> None:
-    make_ephemeris_engine(isolated_doctor, 1)
+    make_ephemeris_engine(isolated_doctor, 2)
     source = isolated_doctor.parent / "wal-source"
     source_database = make_database(source, 1)
     writer = sqlite3.connect(source_database)
     writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute("PRAGMA user_version = 2")
     writer.execute("INSERT INTO fixture DEFAULT VALUES")
     writer.commit()
     try:
@@ -121,23 +123,160 @@ def test_wal_database_inspection_creates_no_sidecar_or_directory_entry(
         root.mkdir()
         database = root / "activity.sqlite"
         wal = database.with_name(database.name + "-wal")
+        shm = database.with_name(database.name + "-shm")
+        database.write_bytes(source_database.read_bytes())
+        wal.write_bytes(
+            source_database.with_name(source_database.name + "-wal").read_bytes()
+        )
+        shm.write_bytes(
+            source_database.with_name(source_database.name + "-shm").read_bytes()
+        )
+        fresh_backup(root)
+        before = {entry.name for entry in root.iterdir()}
+        wal_before = wal.read_bytes()
+
+        checks = doctor.ephemeris_checks(root, False)
+
+        assert {entry.name for entry in root.iterdir()} == before
+        assert wal.exists()
+        assert shm.exists()
+        assert wal.read_bytes() == wal_before
+        readable = by_id(checks, "subsystem.ephemeris.database_readable")
+        assert readable.status == "ok"
+        assert "WAL tail visible" in readable.detail
+        assert by_id(checks, "subsystem.ephemeris.schema_compatible").status == "ok"
+        assert by_id(checks, "subsystem.ephemeris.integrity_check").status == "ok"
+    finally:
+        writer.close()
+
+
+def test_wal_without_shm_makes_schema_and_integrity_unverified_without_mutation(
+    isolated_doctor: Path,
+) -> None:
+    make_ephemeris_engine(isolated_doctor, 2)
+    source = isolated_doctor.parent / "wal-source-without-shm"
+    source_database = make_database(source, 1)
+    writer = sqlite3.connect(source_database)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute("PRAGMA user_version = 2")
+    writer.execute("INSERT INTO fixture DEFAULT VALUES")
+    writer.commit()
+    try:
+        root = isolated_doctor.parent / "private-wal-without-shm"
+        root.mkdir()
+        database = root / "activity.sqlite"
+        wal = database.with_name(database.name + "-wal")
+        shm = database.with_name(database.name + "-shm")
         database.write_bytes(source_database.read_bytes())
         wal.write_bytes(
             source_database.with_name(source_database.name + "-wal").read_bytes()
         )
         fresh_backup(root)
         before = {entry.name for entry in root.iterdir()}
+        wal_before = wal.read_bytes()
 
         checks = doctor.ephemeris_checks(root, False)
 
         assert {entry.name for entry in root.iterdir()} == before
         assert wal.exists()
-        assert not database.with_name(database.name + "-shm").exists()
-        readable = by_id(checks, "subsystem.ephemeris.database_readable")
-        assert readable.status == "ok"
-        assert "pending WAL writes are not visible" in readable.detail
+        assert not shm.exists()
+        assert wal.read_bytes() == wal_before
+        for check_id in (
+            "subsystem.ephemeris.schema_compatible",
+            "subsystem.ephemeris.integrity_check",
+        ):
+            finding = by_id(checks, check_id)
+            assert finding.status == "warning"
+            assert "unverified" in finding.detail
+            assert "WAL tail is not visible" in finding.detail
     finally:
         writer.close()
+
+
+def test_empty_wal_does_not_soften_corrupt_main_file_or_mutate_sidecars(
+    isolated_doctor: Path,
+) -> None:
+    make_ephemeris_engine(isolated_doctor, 1)
+    root = isolated_doctor.parent / "private-empty-wal-corrupt-main"
+    database = make_database(root, 1)
+    connection = sqlite3.connect(database)
+    connection.executemany(
+        "INSERT INTO fixture DEFAULT VALUES",
+        [() for _ in range(200)],
+    )
+    connection.commit()
+    page_size = connection.execute("PRAGMA page_size").fetchone()[0]
+    connection.close()
+    contents = bytearray(database.read_bytes())
+    contents[page_size : 2 * page_size] = b"X" * page_size
+    database.write_bytes(contents)
+    wal = database.with_name(database.name + "-wal")
+    shm = database.with_name(database.name + "-shm")
+    wal.write_bytes(b"")
+    fresh_backup(root)
+    before = {entry.name for entry in root.iterdir()}
+
+    checks = doctor.ephemeris_checks(root, False)
+
+    assert by_id(checks, "subsystem.ephemeris.integrity_check").status == "blocked"
+    assert {entry.name for entry in root.iterdir()} == before
+    assert wal.exists() and wal.stat().st_size == 0
+    assert not shm.exists()
+
+
+def test_existing_wal_and_shm_recovery_refusal_is_warning_without_mutation(
+    isolated_doctor: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = isolated_doctor.parent / "private-readonly-recovery"
+    database = make_database(root, 1)
+    wal = database.with_name(database.name + "-wal")
+    shm = database.with_name(database.name + "-shm")
+    wal.write_bytes(b"W" * doctor.SQLITE_WAL_HEADER_BYTES)
+    shm.write_bytes(b"S" * 32)
+    fresh_backup(root)
+    before = {entry.name for entry in root.iterdir()}
+    sidecars_before = {path.name: path.read_bytes() for path in (wal, shm)}
+
+    class Result:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class RecoveryRefused:
+        def execute(self, statement):
+            if statement == "PRAGMA user_version":
+                return Result((1,))
+            error = sqlite3.OperationalError("fixture recovery refusal")
+            error.sqlite_errorcode = sqlite3.SQLITE_READONLY_RECOVERY
+            raise error
+
+        def close(self):
+            return None
+
+    uris: list[str] = []
+
+    def connect(database_uri, **_kwargs):
+        uris.append(database_uri)
+        return RecoveryRefused()
+
+    monkeypatch.setattr(doctor.sqlite3, "connect", connect)
+    checks = doctor.ephemeris_checks(root, False)
+
+    assert by_id(checks, "subsystem.ephemeris.database_readable").status == "warning"
+    assert by_id(checks, "subsystem.ephemeris.schema_compatible").status == (
+        "not_applicable"
+    )
+    assert by_id(checks, "subsystem.ephemeris.integrity_check").status == (
+        "not_applicable"
+    )
+    assert "could not be inspected without writing" in checks[0].detail
+    assert uris[0].endswith("?mode=ro")
+    assert {entry.name for entry in root.iterdir()} == before
+    assert {path.name: path.read_bytes() for path in (wal, shm)} == sidecars_before
 
 
 def test_failed_integrity_with_wal_is_warning(
@@ -145,7 +284,7 @@ def test_failed_integrity_with_wal_is_warning(
 ) -> None:
     root = isolated_doctor.parent / "private-pending-writes"
     database = make_database(root, 1)
-    database.with_name(database.name + "-wal").write_bytes(b"fixture")
+    database.with_name(database.name + "-wal").write_bytes(b"fixture" * 5)
     fresh_backup(root)
 
     class UserVersion:
@@ -171,9 +310,7 @@ def test_failed_integrity_with_wal_is_warning(
     checks = doctor.ephemeris_checks(root, False)
     integrity = by_id(checks, "subsystem.ephemeris.integrity_check")
     assert integrity.status == "warning"
-    assert integrity.detail == (
-        "integrity could not be verified while writes are pending"
-    )
+    assert integrity.detail == "integrity is unverified because the WAL tail is not visible"
     assert uris[0].endswith("?mode=ro&immutable=1")
 
 
@@ -296,6 +433,25 @@ def test_malformed_journal_reports_only_name_and_row(isolated_doctor: Path) -> N
     assert "PRIVATE-ROW-CONTENT" not in finding.detail
     assert "atlas-secret-root-marker" not in finding.detail
     assert by_id(checks, "subsystem.atlas.receipts_complete").status == "not_applicable"
+
+
+@pytest.mark.parametrize("number", ["1e999", "-1e999"])
+def test_overflowed_json_number_is_malformed(
+    isolated_doctor: Path,
+    number: str,
+) -> None:
+    root = make_atlas(isolated_doctor.parent / "atlas-overflow")
+    (root / "state" / "events.jsonl").write_text(
+        f'{{"value":{number}}}\n',
+        encoding="utf-8",
+    )
+    finding = by_id(
+        doctor.atlas_checks(root, False),
+        "subsystem.atlas.journals_parse",
+    )
+    assert finding.status == "blocked"
+    assert "row 1" in finding.detail
+    assert number not in finding.detail
 
 
 def test_healthy_receipts_are_complete(isolated_doctor: Path) -> None:
