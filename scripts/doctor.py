@@ -8,10 +8,10 @@ subsystems together, private roots are discovered from each subsystem
 environment variable and then ``~/.config/selfos/config.toml``; doctor has no
 per-subsystem ``--instance`` flag. Requires Python 3.11+ (tomllib).
 
-SQLite inspection selects a read-only view from existing sidecars. When both
-WAL and SHM already exist, ordinary read-only mode includes the WAL tail;
-otherwise immutable read-only mode avoids creating sidecars and any real WAL
-tail makes schema and integrity results explicitly unverified.
+SQLite inspection always uses immutable read-only mode so it cannot create or
+modify sidecars. A bounded WAL-header probe recognizes a complete pending WAL
+frame; when one exists, schema and integrity results are explicitly unverified
+because immutable inspection cannot see the WAL tail.
 """
 
 from __future__ import annotations
@@ -54,10 +54,13 @@ OVERRIDE_RECENT_DAYS = 90
 RUNNER_VERSION_TIMEOUT_SECONDS = 3
 RUNNER_VERSION_MAX_BYTES = 4 * 1024
 SQLITE_WAL_HEADER_BYTES = 32
+SQLITE_WAL_FRAME_HEADER_BYTES = 24
+SQLITE_WAL_MAGIC = {0x377F0682, 0x377F0683}
 ATLAS_MAX_STATE_ENTRIES = 1024
 ATLAS_MAX_JOURNALS = 256
 ATLAS_MAX_JOURNAL_BYTES = 8 * 1024 * 1024
 ATLAS_MAX_RECEIPT_BYTES = 32 * 1024 * 1024
+ATLAS_MAX_TOTAL_JOURNAL_BYTES = 64 * 1024 * 1024
 ATLAS_MAX_RECEIPT_KEYS = 100_000
 
 
@@ -529,7 +532,7 @@ def _open_directory_no_follow(path: Path) -> int:
     absolute = Path(os.path.abspath(path))
     flags = os.O_RDONLY
     flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
     directory_fd = os.open(absolute.anchor, flags)
     try:
         for component in absolute.parts[1:]:
@@ -557,13 +560,36 @@ def _sqlite_is_busy(exc: sqlite3.Error) -> bool:
     return "locked" in lowered or "busy" in lowered
 
 
-def _sqlite_read_only_sidecar_failure(exc: sqlite3.Error) -> bool:
-    """Recognize WAL recovery/open failures that read-only mode cannot repair."""
-    code = getattr(exc, "sqlite_errorcode", None)
-    return isinstance(code, int) and (code & 0xFF) in {
-        sqlite3.SQLITE_READONLY,
-        sqlite3.SQLITE_CANTOPEN,
-    }
+def _sqlite_has_pending_wal(wal: Path) -> bool:
+    """Recognize one complete WAL frame through a bounded, nonblocking read."""
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    file_fd: int | None = None
+    try:
+        file_fd = os.open(wal, flags)
+        info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode):
+            return False
+        header = os.read(file_fd, SQLITE_WAL_HEADER_BYTES)
+    except OSError:
+        return False
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+    if len(header) != SQLITE_WAL_HEADER_BYTES:
+        return False
+    magic = int.from_bytes(header[:4], "big")
+    page_size = int.from_bytes(header[8:12], "big")
+    valid_page_size = (
+        512 <= page_size <= 65536 and page_size & (page_size - 1) == 0
+    )
+    return (
+        magic in SQLITE_WAL_MAGIC
+        and valid_page_size
+        and info.st_size
+        >= SQLITE_WAL_HEADER_BYTES + SQLITE_WAL_FRAME_HEADER_BYTES + page_size
+    )
 
 
 def _ephemeris_schema_version() -> int | None:
@@ -738,7 +764,7 @@ def ephemeris_checks(
     # app/settings.py uses <data_dir>/activity.sqlite only as its unset default.
     # Requiring containment under ACTIVITY_DATA_DIR would reject supported,
     # deliberate layouts. The public-checkout boundary is the invariant here.
-    public_label = containing_public_root(database) if override else None
+    public_label = containing_public_root(database)
     if public_label is not None:
         boundary = "configured ledger database is inside the " + (
             f"{public_label} public checkout"
@@ -820,31 +846,11 @@ def ephemeris_checks(
         ]
 
     wal = database.with_name(database.name + "-wal")
-    shm = database.with_name(database.name + "-shm")
-    try:
-        wal_info = wal.lstat()
-    except OSError:
-        wal_exists = False
-        wal_pending = False
-    else:
-        wal_exists = True
-        wal_pending = (
-            stat.S_ISREG(wal_info.st_mode)
-            and wal_info.st_size >= SQLITE_WAL_HEADER_BYTES
-        )
-    try:
-        shm.lstat()
-    except OSError:
-        shm_exists = False
-    else:
-        shm_exists = True
-
-    wal_visible = wal_exists and shm_exists
-    query = "?mode=ro" if wal_visible else "?mode=ro&immutable=1"
+    wal_pending = _sqlite_has_pending_wal(wal)
     connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(
-            database.absolute().as_uri() + query,
+            database.absolute().as_uri() + "?mode=ro&immutable=1",
             uri=True,
             timeout=0.2,
         )
@@ -853,12 +859,9 @@ def ephemeris_checks(
             raise sqlite3.DatabaseError("invalid user_version result")
         actual_version = row[0]
     except sqlite3.Error as exc:
-        sidecar_failure = wal_visible and _sqlite_read_only_sidecar_failure(exc)
         transient = _sqlite_is_busy(exc)
-        status = "warning" if sidecar_failure or transient else "blocked"
-        if sidecar_failure:
-            detail = "ledger could not be inspected without writing"
-        elif transient:
+        status = "warning" if transient else "blocked"
+        if transient:
             detail = "ledger database could not be checked now"
         else:
             detail = "ledger database is present but cannot be opened read-only"
@@ -868,9 +871,7 @@ def ephemeris_checks(
             status,
             detail + path_suffix(database, show_paths),
             (
-                "Recover or checkpoint the ledger explicitly before retrying."
-                if sidecar_failure
-                else "Try again after the active database operation finishes."
+                "Try again after the active database operation finishes."
                 if transient
                 else "Restore a readable SQLite ledger; doctor will not repair it."
             ),
@@ -898,16 +899,11 @@ def ephemeris_checks(
         "subsystem.ephemeris.database_readable",
         "ephemeris",
         "ok",
-        (
-            "ledger database opens read-only with its existing WAL tail visible"
-            if wal_visible
-            else "ledger database opens through an immutable read-only SQLite "
-            "connection"
-        )
+        "ledger database opens through an immutable read-only SQLite connection"
         + path_suffix(database, show_paths),
     )
     expected_version = _ephemeris_schema_version()
-    if wal_pending and not wal_visible:
+    if wal_pending:
         schema = Check(
             "subsystem.ephemeris.schema_compatible",
             "ephemeris",
@@ -948,19 +944,10 @@ def ephemeris_checks(
             f"database and engine schema versions match at {actual_version}",
         )
 
-    sidecar_refused = False
     try:
         quick_rows = connection.execute("PRAGMA quick_check(1)").fetchall()
     except sqlite3.Error as exc:
-        if wal_visible and _sqlite_read_only_sidecar_failure(exc):
-            sidecar_refused = True
-            integrity = Check(
-                "subsystem.ephemeris.integrity_check",
-                "ephemeris",
-                "not_applicable",
-                "integrity cannot be checked without writing",
-            )
-        elif wal_pending and not wal_visible:
+        if wal_pending:
             integrity = Check(
                 "subsystem.ephemeris.integrity_check",
                 "ephemeris",
@@ -986,7 +973,7 @@ def ephemeris_checks(
             )
     else:
         passed = quick_rows == [("ok",)]
-        unverified = wal_pending and not wal_visible
+        unverified = wal_pending
         status = "warning" if unverified else ("ok" if passed else "blocked")
         integrity = Check(
             "subsystem.ephemeris.integrity_check",
@@ -1007,25 +994,6 @@ def ephemeris_checks(
         )
     finally:
         connection.close()
-    if sidecar_refused:
-        return [
-            Check(
-                "subsystem.ephemeris.database_readable",
-                "ephemeris",
-                "warning",
-                "ledger could not be inspected without writing"
-                + path_suffix(database, show_paths),
-                "Recover or checkpoint the ledger explicitly before retrying.",
-            ),
-            Check(
-                "subsystem.ephemeris.schema_compatible",
-                "ephemeris",
-                "not_applicable",
-                "schema cannot be checked without writing",
-            ),
-            integrity,
-            _ephemeris_backup_check(root, show_paths),
-        ]
     return [readability, schema, integrity, _ephemeris_backup_check(root, show_paths)]
 
 
@@ -1134,6 +1102,7 @@ def _atlas_journal_scan(root: Path, show_paths: bool) -> AtlasJournalScan:
 
     capped = False
     enumeration_capped = False
+    receipt_enumeration_incomplete = False
     journal_names: list[tuple[str | None, str]] = []
     try:
         try:
@@ -1159,6 +1128,7 @@ def _atlas_journal_scan(root: Path, show_paths: bool) -> AtlasJournalScan:
         directory_flags |= getattr(os, "O_DIRECTORY", 0)
         directory_flags |= getattr(os, "O_NOFOLLOW", 0)
         directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_NONBLOCK", 0)
         for entry in entries:
             try:
                 mode = entry.stat(follow_symlinks=False).st_mode
@@ -1227,6 +1197,10 @@ def _atlas_journal_scan(root: Path, show_paths: bool) -> AtlasJournalScan:
                                 journal_names.append(
                                     (entry.name, rotated_entry.name)
                                 )
+                            elif stat.S_ISDIR(rotated_mode):
+                                capped = True
+                                if entry.name == "receipts":
+                                    receipt_enumeration_incomplete = True
                 except OSError:
                     return AtlasJournalScan(Check(
                         "subsystem.atlas.journals_parse",
@@ -1256,15 +1230,22 @@ def _atlas_journal_scan(root: Path, show_paths: bool) -> AtlasJournalScan:
         receipt_latest: dict[str, tuple[str, bool]] = {}
         receipt_shape_valid = True
         receipt_bytes = 0
+        journal_bytes = 0
         receipt_budget_exceeded = False
-        receipts_complete = not enumeration_capped and receipt_files == sum(
-            directory == "receipts" or (directory is None and name == "receipts.jsonl")
-            for directory, name in journal_names
+        receipts_complete = (
+            not enumeration_capped
+            and not receipt_enumeration_incomplete
+            and receipt_files
+            == sum(
+                directory == "receipts"
+                or (directory is None and name == "receipts.jsonl")
+                for directory, name in journal_names
+            )
         )
         file_flags = os.O_RDONLY
         file_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
         file_flags |= getattr(os, "O_NONBLOCK", 0)
-        for directory, name in journal_names:
+        for index, (directory, name) in enumerate(journal_names):
             is_receipt = directory == "receipts" or (
                 directory is None and name == "receipts.jsonl"
             )
@@ -1290,6 +1271,19 @@ def _atlas_journal_scan(root: Path, show_paths: bool) -> AtlasJournalScan:
                         "or special file",
                         "Replace it with an lstat-confirmed regular file.",
                     ))
+                if journal_bytes + info.st_size > ATLAS_MAX_TOTAL_JOURNAL_BYTES:
+                    os.close(file_fd)
+                    capped = True
+                    if any(
+                        remaining_directory == "receipts"
+                        or (
+                            remaining_directory is None
+                            and remaining_name == "receipts.jsonl"
+                        )
+                        for remaining_directory, remaining_name in journal_names[index:]
+                    ):
+                        receipts_complete = False
+                    break
                 if (
                     is_receipt
                     and receipt_bytes + info.st_size > ATLAS_MAX_RECEIPT_BYTES
@@ -1305,8 +1299,10 @@ def _atlas_journal_scan(root: Path, show_paths: bool) -> AtlasJournalScan:
                     if is_receipt:
                         receipts_complete = False
                     continue
+                remaining_bytes = ATLAS_MAX_TOTAL_JOURNAL_BYTES - journal_bytes
+                read_limit = min(ATLAS_MAX_JOURNAL_BYTES, remaining_bytes)
                 with os.fdopen(file_fd, "rb") as stream:
-                    data = stream.read(ATLAS_MAX_JOURNAL_BYTES + 1)
+                    data = stream.read(read_limit + 1)
             except OSError:
                 return AtlasJournalScan(Check(
                     "subsystem.atlas.journals_parse",
@@ -1317,6 +1313,18 @@ def _atlas_journal_scan(root: Path, show_paths: bool) -> AtlasJournalScan:
             finally:
                 if parent_fd != state_fd:
                     os.close(parent_fd)
+            if len(data) > remaining_bytes:
+                capped = True
+                if any(
+                    remaining_directory == "receipts"
+                    or (
+                        remaining_directory is None
+                        and remaining_name == "receipts.jsonl"
+                    )
+                    for remaining_directory, remaining_name in journal_names[index:]
+                ):
+                    receipts_complete = False
+                break
             if len(data) > ATLAS_MAX_JOURNAL_BYTES:
                 capped = True
                 if is_receipt:
@@ -1330,6 +1338,7 @@ def _atlas_journal_scan(root: Path, show_paths: bool) -> AtlasJournalScan:
                 receipts_complete = False
                 receipt_budget_exceeded = True
                 continue
+            journal_bytes += len(data)
             rows, bad_row = _parse_jsonl_bytes(data)
             if bad_row is not None:
                 return AtlasJournalScan(
@@ -1750,6 +1759,7 @@ def runtime_override_check(override_value: str | None, show_paths: bool) -> Chec
             remediation,
         )
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
     try:
         file_fd = os.open(path, flags)
         try:

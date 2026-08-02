@@ -43,6 +43,31 @@ def fresh_backup(root: Path) -> None:
     (backups / "synthetic.backup").write_bytes(b"")
 
 
+def sidecar_metadata(database: Path) -> dict[str, tuple[int, int] | None]:
+    """Snapshot only mutation-relevant metadata for the two SQLite sidecars."""
+    result: dict[str, tuple[int, int] | None] = {}
+    for suffix in ("-wal", "-shm"):
+        sidecar = database.with_name(database.name + suffix)
+        try:
+            info = sidecar.stat()
+        except FileNotFoundError:
+            result[suffix] = None
+        else:
+            result[suffix] = (info.st_size, info.st_mtime_ns)
+    return result
+
+
+def synthetic_pending_wal(page_size: int = 512) -> bytes:
+    """Build a header and one full frame for doctor's bounded WAL probe."""
+    header = (
+        (0x377F0682).to_bytes(4, "big")
+        + (3_007_000).to_bytes(4, "big")
+        + page_size.to_bytes(4, "big")
+        + bytes(20)
+    )
+    return header + bytes(doctor.SQLITE_WAL_FRAME_HEADER_BYTES + page_size)
+
+
 def make_atlas(root: Path) -> Path:
     """Create the required directories and a healthy real-layout receipt tail."""
     (root / "atlas").mkdir(parents=True)
@@ -106,7 +131,7 @@ def test_busy_database_does_not_block_immutable_inspection(
     assert readable.status != "blocked"
 
 
-def test_wal_and_shm_make_schema_and_integrity_authoritative_without_mutation(
+def test_wal_and_shm_make_schema_and_integrity_unverified_without_mutation(
     isolated_doctor: Path,
 ) -> None:
     make_ephemeris_engine(isolated_doctor, 2)
@@ -133,19 +158,23 @@ def test_wal_and_shm_make_schema_and_integrity_authoritative_without_mutation(
         )
         fresh_backup(root)
         before = {entry.name for entry in root.iterdir()}
-        wal_before = wal.read_bytes()
+        sidecars_before = sidecar_metadata(database)
 
         checks = doctor.ephemeris_checks(root, False)
 
         assert {entry.name for entry in root.iterdir()} == before
-        assert wal.exists()
-        assert shm.exists()
-        assert wal.read_bytes() == wal_before
+        assert sidecar_metadata(database) == sidecars_before
         readable = by_id(checks, "subsystem.ephemeris.database_readable")
         assert readable.status == "ok"
-        assert "WAL tail visible" in readable.detail
-        assert by_id(checks, "subsystem.ephemeris.schema_compatible").status == "ok"
-        assert by_id(checks, "subsystem.ephemeris.integrity_check").status == "ok"
+        assert "immutable read-only" in readable.detail
+        for check_id in (
+            "subsystem.ephemeris.schema_compatible",
+            "subsystem.ephemeris.integrity_check",
+        ):
+            finding = by_id(checks, check_id)
+            assert finding.status == "warning"
+            assert "unverified" in finding.detail
+            assert "WAL tail is not visible" in finding.detail
     finally:
         writer.close()
 
@@ -174,14 +203,12 @@ def test_wal_without_shm_makes_schema_and_integrity_unverified_without_mutation(
         )
         fresh_backup(root)
         before = {entry.name for entry in root.iterdir()}
-        wal_before = wal.read_bytes()
+        sidecars_before = sidecar_metadata(database)
 
         checks = doctor.ephemeris_checks(root, False)
 
         assert {entry.name for entry in root.iterdir()} == before
-        assert wal.exists()
-        assert not shm.exists()
-        assert wal.read_bytes() == wal_before
+        assert sidecar_metadata(database) == sidecars_before
         for check_id in (
             "subsystem.ephemeris.schema_compatible",
             "subsystem.ephemeris.integrity_check",
@@ -194,7 +221,7 @@ def test_wal_without_shm_makes_schema_and_integrity_unverified_without_mutation(
         writer.close()
 
 
-def test_empty_wal_does_not_soften_corrupt_main_file_or_mutate_sidecars(
+def test_junk_wal_does_not_soften_corrupt_main_file_or_mutate_sidecars(
     isolated_doctor: Path,
 ) -> None:
     make_ephemeris_engine(isolated_doctor, 1)
@@ -213,19 +240,19 @@ def test_empty_wal_does_not_soften_corrupt_main_file_or_mutate_sidecars(
     database.write_bytes(contents)
     wal = database.with_name(database.name + "-wal")
     shm = database.with_name(database.name + "-shm")
-    wal.write_bytes(b"")
+    wal.write_bytes(b"J" * doctor.SQLITE_WAL_HEADER_BYTES)
     fresh_backup(root)
     before = {entry.name for entry in root.iterdir()}
+    sidecars_before = sidecar_metadata(database)
 
     checks = doctor.ephemeris_checks(root, False)
 
     assert by_id(checks, "subsystem.ephemeris.integrity_check").status == "blocked"
     assert {entry.name for entry in root.iterdir()} == before
-    assert wal.exists() and wal.stat().st_size == 0
-    assert not shm.exists()
+    assert sidecar_metadata(database) == sidecars_before
 
 
-def test_existing_wal_and_shm_recovery_refusal_is_warning_without_mutation(
+def test_valid_wal_header_with_full_frame_always_uses_immutable_connection(
     isolated_doctor: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -233,11 +260,11 @@ def test_existing_wal_and_shm_recovery_refusal_is_warning_without_mutation(
     database = make_database(root, 1)
     wal = database.with_name(database.name + "-wal")
     shm = database.with_name(database.name + "-shm")
-    wal.write_bytes(b"W" * doctor.SQLITE_WAL_HEADER_BYTES)
+    wal.write_bytes(synthetic_pending_wal())
     shm.write_bytes(b"S" * 32)
     fresh_backup(root)
     before = {entry.name for entry in root.iterdir()}
-    sidecars_before = {path.name: path.read_bytes() for path in (wal, shm)}
+    sidecars_before = sidecar_metadata(database)
 
     class Result:
         def __init__(self, row):
@@ -246,13 +273,11 @@ def test_existing_wal_and_shm_recovery_refusal_is_warning_without_mutation(
         def fetchone(self):
             return self.row
 
-    class RecoveryRefused:
+    class QuickCheckRefused:
         def execute(self, statement):
             if statement == "PRAGMA user_version":
                 return Result((1,))
-            error = sqlite3.OperationalError("fixture recovery refusal")
-            error.sqlite_errorcode = sqlite3.SQLITE_READONLY_RECOVERY
-            raise error
+            raise sqlite3.DatabaseError("fixture quick-check refusal")
 
         def close(self):
             return None
@@ -261,22 +286,17 @@ def test_existing_wal_and_shm_recovery_refusal_is_warning_without_mutation(
 
     def connect(database_uri, **_kwargs):
         uris.append(database_uri)
-        return RecoveryRefused()
+        return QuickCheckRefused()
 
     monkeypatch.setattr(doctor.sqlite3, "connect", connect)
     checks = doctor.ephemeris_checks(root, False)
 
-    assert by_id(checks, "subsystem.ephemeris.database_readable").status == "warning"
-    assert by_id(checks, "subsystem.ephemeris.schema_compatible").status == (
-        "not_applicable"
-    )
-    assert by_id(checks, "subsystem.ephemeris.integrity_check").status == (
-        "not_applicable"
-    )
-    assert "could not be inspected without writing" in checks[0].detail
-    assert uris[0].endswith("?mode=ro")
+    assert by_id(checks, "subsystem.ephemeris.database_readable").status == "ok"
+    assert by_id(checks, "subsystem.ephemeris.schema_compatible").status == "warning"
+    assert by_id(checks, "subsystem.ephemeris.integrity_check").status == "warning"
+    assert uris[0].endswith("?mode=ro&immutable=1")
     assert {entry.name for entry in root.iterdir()} == before
-    assert {path.name: path.read_bytes() for path in (wal, shm)} == sidecars_before
+    assert sidecar_metadata(database) == sidecars_before
 
 
 def test_failed_integrity_with_wal_is_warning(
@@ -284,8 +304,9 @@ def test_failed_integrity_with_wal_is_warning(
 ) -> None:
     root = isolated_doctor.parent / "private-pending-writes"
     database = make_database(root, 1)
-    database.with_name(database.name + "-wal").write_bytes(b"fixture" * 5)
+    database.with_name(database.name + "-wal").write_bytes(synthetic_pending_wal())
     fresh_backup(root)
+    sidecars_before = sidecar_metadata(database)
 
     class UserVersion:
         def fetchone(self):
@@ -312,6 +333,7 @@ def test_failed_integrity_with_wal_is_warning(
     assert integrity.status == "warning"
     assert integrity.detail == "integrity is unverified because the WAL tail is not visible"
     assert uris[0].endswith("?mode=ro&immutable=1")
+    assert sidecar_metadata(database) == sidecars_before
 
 
 def test_newer_and_older_database_versions_have_required_severity(
@@ -398,6 +420,32 @@ def test_activity_db_override_inside_public_checkout_is_not_opened(
 
     monkeypatch.setattr(doctor.sqlite3, "connect", reject_open)
     checks = doctor.ephemeris_checks(root, False)
+    readable = by_id(checks, "subsystem.ephemeris.database_readable")
+    assert readable.status == "blocked"
+    assert "public checkout" in readable.detail
+    assert "fixture" not in readable.detail
+    assert by_id(checks, "subsystem.ephemeris.schema_compatible").status == (
+        "not_applicable"
+    )
+    assert by_id(checks, "subsystem.ephemeris.integrity_check").status == (
+        "not_applicable"
+    )
+
+
+def test_default_activity_db_symlink_into_public_checkout_is_not_opened(
+    isolated_doctor: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = isolated_doctor.parent / "private-default-activity-root"
+    root.mkdir()
+    public_database = make_database(isolated_doctor / "fixture", 1)
+    (root / "activity.sqlite").symlink_to(public_database)
+
+    def reject_open(*_args, **_kwargs):
+        pytest.fail("public-checkout database target must not be opened")
+
+    monkeypatch.setattr(doctor.sqlite3, "connect", reject_open)
+    checks = doctor.ephemeris_checks(root, False)
+
     readable = by_id(checks, "subsystem.ephemeris.database_readable")
     assert readable.status == "blocked"
     assert "public checkout" in readable.detail
@@ -607,6 +655,40 @@ def test_symlinked_rotated_journal_is_blocked_without_following(
     assert "PRIVATE-ROTATED-OUTSIDE-CONTENT" not in finding.detail
 
 
+def test_nested_rotation_directory_marks_journal_scan_incomplete(
+    isolated_doctor: Path,
+) -> None:
+    root = make_atlas(isolated_doctor.parent / "atlas-nested-rotation")
+    nested = root / "state" / "events" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "ignored.jsonl").write_text('{"safe":true}\n', encoding="utf-8")
+
+    checks = doctor.atlas_checks(root, False)
+
+    finding = by_id(checks, "subsystem.atlas.journals_parse")
+    assert finding.status == "warning"
+    assert "not fully checked" in finding.detail
+
+
+def test_nested_receipt_rotation_makes_completeness_not_applicable(
+    isolated_doctor: Path,
+) -> None:
+    root = make_atlas(isolated_doctor.parent / "atlas-nested-receipts")
+    nested = root / "state" / "receipts" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "ignored.jsonl").write_text(
+        '{"intake":"fixture-key","marker":"opened"}\n',
+        encoding="utf-8",
+    )
+
+    checks = doctor.atlas_checks(root, False)
+
+    assert by_id(checks, "subsystem.atlas.journals_parse").status == "warning"
+    receipts = by_id(checks, "subsystem.atlas.receipts_complete")
+    assert receipts.status == "not_applicable"
+    assert "not fully checked" in receipts.detail
+
+
 def test_journal_byte_cap_is_warning_not_failure(
     isolated_doctor: Path, monkeypatch
 ) -> None:
@@ -639,6 +721,25 @@ def test_aggregate_receipt_byte_cap_warns_and_skips_completeness(
     assert by_id(checks, "subsystem.atlas.receipts_complete").status == (
         "not_applicable"
     )
+
+
+def test_aggregate_all_journal_byte_cap_warns(
+    isolated_doctor: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = make_atlas(isolated_doctor.parent / "atlas-all-journal-byte-budget")
+    (root / "state" / "receipts.jsonl").write_bytes(b"")
+    journal = b'{"safe":true}\n'
+    (root / "state" / "alpha.jsonl").write_bytes(journal)
+    (root / "state" / "beta.jsonl").write_bytes(journal)
+    monkeypatch.setattr(doctor, "ATLAS_MAX_TOTAL_JOURNAL_BYTES", len(journal))
+
+    finding = by_id(
+        doctor.atlas_checks(root, False),
+        "subsystem.atlas.journals_parse",
+    )
+
+    assert finding.status == "warning"
+    assert "not fully checked" in finding.detail
 
 
 def test_aggregate_receipt_key_cap_warns_and_skips_completeness(

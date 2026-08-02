@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -121,6 +122,21 @@ def test_unknown_user_override_path_warns_without_expansion_crash() -> None:
     assert finding.status == "warning"
     assert finding.detail == "configured runtime override is missing or unreadable"
     assert "missing-user" not in finding.detail
+
+
+def test_override_fifo_without_writer_is_rejected_without_blocking(
+    isolated_doctor: Path,
+) -> None:
+    override = isolated_doctor.parent / "private-override-fifo"
+    os.mkfifo(override)
+
+    started = time.monotonic()
+    finding = doctor.runtime_override_check(str(override), False)
+    elapsed = time.monotonic() - started
+
+    assert finding.status == "warning"
+    assert finding.detail == "configured runtime override is missing or unreadable"
+    assert elapsed < 1
 
 
 @pytest.mark.parametrize("failure", ["budget", "timeout"])
