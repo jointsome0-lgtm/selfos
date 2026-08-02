@@ -24,6 +24,7 @@ import math
 import os
 import re
 import select
+import signal
 import shutil
 import sqlite3
 import stat
@@ -57,6 +58,12 @@ RUNNER_VERSION_MAX_BYTES = 4 * 1024
 SQLITE_WAL_HEADER_BYTES = 32
 SQLITE_WAL_FRAME_HEADER_BYTES = 24
 SQLITE_WAL_MAGIC = {0x377F0682, 0x377F0683}
+SQLITE_WAL_MAX_FRAMES = 4096
+WAL_ABSENT = "absent"
+WAL_COMMITTED = "committed"
+WAL_INVALID = "invalid"
+WAL_UNCOMMITTED = "uncommitted"
+WAL_UNREADABLE = "unreadable"
 ATLAS_MAX_STATE_ENTRIES = 1024
 ATLAS_MAX_JOURNALS = 256
 ATLAS_MAX_JOURNAL_BYTES = 8 * 1024 * 1024
@@ -234,7 +241,15 @@ def abbreviated(sha: str) -> str:
 
 def path_suffix(path: Path, show_paths: bool) -> str:
     """Reveal a resolved path only when the caller explicitly requested it."""
-    return f" at {path.resolve()}" if show_paths else ""
+    if not show_paths:
+        return ""
+    try:
+        rendered = path.resolve()
+    except ValueError:
+        return " at <invalid path>"
+    except (OSError, RuntimeError):
+        rendered = path.absolute()
+    return f" at {rendered}"
 
 
 def repo_checks(
@@ -411,7 +426,7 @@ def _configured_instance_path(value: str) -> Path | None:
             root.resolve(strict=True)
         except FileNotFoundError:
             pass
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         return None
     return root
 
@@ -579,8 +594,8 @@ def _sqlite_is_busy(exc: sqlite3.Error) -> bool:
     return "locked" in lowered or "busy" in lowered
 
 
-def _sqlite_has_pending_wal(wal: Path) -> bool | None:
-    """Recognize a pending WAL, distinguishing absence from unreadability."""
+def _sqlite_wal_state(wal: Path) -> str:
+    """Boundedly distinguish absent, committed, invalid, and transient WALs."""
     flags = os.O_RDONLY
     flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NONBLOCK", 0)
@@ -589,28 +604,51 @@ def _sqlite_has_pending_wal(wal: Path) -> bool | None:
         file_fd = os.open(wal, flags)
         info = os.fstat(file_fd)
         if not stat.S_ISREG(info.st_mode):
-            return None
-        header = os.read(file_fd, SQLITE_WAL_HEADER_BYTES)
+            return WAL_UNREADABLE
+        if info.st_size == 0:
+            return WAL_ABSENT
+        header = os.pread(file_fd, SQLITE_WAL_HEADER_BYTES, 0)
+        if len(header) != SQLITE_WAL_HEADER_BYTES:
+            return WAL_INVALID
+        magic = int.from_bytes(header[:4], "big")
+        page_size = int.from_bytes(header[8:12], "big")
+        valid_page_size = (
+            512 <= page_size <= 65536 and page_size & (page_size - 1) == 0
+        )
+        if magic not in SQLITE_WAL_MAGIC or not valid_page_size:
+            return WAL_INVALID
+
+        frame_size = SQLITE_WAL_FRAME_HEADER_BYTES + page_size
+        payload_size = info.st_size - SQLITE_WAL_HEADER_BYTES
+        if payload_size == 0:
+            return WAL_ABSENT
+        complete_frames = payload_size // frame_size
+        if complete_frames == 0:
+            return WAL_INVALID
+        wal_salt = header[16:24]
+        for index in range(min(complete_frames, SQLITE_WAL_MAX_FRAMES)):
+            offset = SQLITE_WAL_HEADER_BYTES + index * frame_size
+            frame = os.pread(file_fd, SQLITE_WAL_FRAME_HEADER_BYTES, offset)
+            if len(frame) != SQLITE_WAL_FRAME_HEADER_BYTES:
+                return WAL_UNREADABLE
+            page_number = int.from_bytes(frame[:4], "big")
+            commit_size = int.from_bytes(frame[4:8], "big")
+            if page_number == 0 or frame[8:16] != wal_salt:
+                return WAL_INVALID
+            if commit_size:
+                return WAL_COMMITTED if commit_size >= page_number else WAL_INVALID
+        if complete_frames > SQLITE_WAL_MAX_FRAMES:
+            return WAL_UNREADABLE
+        if payload_size % frame_size:
+            return WAL_INVALID
+        return WAL_UNCOMMITTED
     except FileNotFoundError:
-        return False
+        return WAL_ABSENT
     except OSError:
-        return None
+        return WAL_UNREADABLE
     finally:
         if file_fd is not None:
             os.close(file_fd)
-    if len(header) != SQLITE_WAL_HEADER_BYTES:
-        return False
-    magic = int.from_bytes(header[:4], "big")
-    page_size = int.from_bytes(header[8:12], "big")
-    valid_page_size = (
-        512 <= page_size <= 65536 and page_size & (page_size - 1) == 0
-    )
-    return (
-        magic in SQLITE_WAL_MAGIC
-        and valid_page_size
-        and info.st_size
-        >= SQLITE_WAL_HEADER_BYTES + SQLITE_WAL_FRAME_HEADER_BYTES + page_size
-    )
 
 
 def _ephemeris_schema_version() -> int | None:
@@ -774,7 +812,8 @@ def ephemeris_checks(
             if override
             else root / "activity.sqlite"
         )
-    except RuntimeError:
+        public_label = containing_public_root(database)
+    except (OSError, RuntimeError, ValueError):
         reason = "configured ledger database path is invalid or unreadable"
         return [
             Check(
@@ -802,7 +841,6 @@ def ephemeris_checks(
     # app/settings.py uses <data_dir>/activity.sqlite only as its unset default.
     # Requiring containment under ACTIVITY_DATA_DIR would reject supported,
     # deliberate layouts. The public-checkout boundary is the invariant here.
-    public_label = containing_public_root(database)
     if public_label is not None:
         boundary = "configured ledger database is inside the " + (
             f"{public_label} public checkout"
@@ -894,18 +932,19 @@ def ephemeris_checks(
         ]
 
     wal = effective_database.with_name(effective_database.name + "-wal")
-    wal_pending = _sqlite_has_pending_wal(wal)
-    wal_unverified = wal_pending is not False
-    wal_reason = (
-        "the WAL tail is not visible"
-        if wal_pending is True
-        else "the WAL file could not be inspected"
-    )
+    wal_state = _sqlite_wal_state(wal)
+    wal_unverified = wal_state != WAL_ABSENT
+    wal_may_hide_committed_tail = wal_state in {WAL_COMMITTED, WAL_UNREADABLE}
+    wal_reason = {
+        WAL_COMMITTED: "the committed WAL tail is not visible",
+        WAL_INVALID: "the WAL file is malformed",
+        WAL_UNCOMMITTED: "the WAL has no committed frame",
+        WAL_UNREADABLE: "the WAL file could not be inspected",
+    }.get(wal_state, "")
     wal_remediation = (
         "Checkpoint the ledger WAL explicitly, then run doctor again."
-        if wal_pending is True
-        else "Restore readable WAL storage or checkpoint it explicitly, then run "
-        "doctor again."
+        if wal_state == WAL_COMMITTED
+        else "Restore or checkpoint the ledger WAL explicitly, then run doctor again."
     )
     connection: sqlite3.Connection | None = None
     try:
@@ -963,7 +1002,7 @@ def ephemeris_checks(
         + path_suffix(database, show_paths),
     )
     expected_version = _ephemeris_schema_version()
-    if wal_unverified:
+    if wal_may_hide_committed_tail:
         schema = Check(
             "subsystem.ephemeris.schema_compatible",
             "ephemeris",
@@ -997,6 +1036,14 @@ def ephemeris_checks(
             f"{expected_version}",
             "Run the ephemeris migration explicitly; doctor will not run it.",
         )
+    elif wal_unverified:
+        schema = Check(
+            "subsystem.ephemeris.schema_compatible",
+            "ephemeris",
+            "warning",
+            f"schema compatibility is unverified because {wal_reason}",
+            wal_remediation,
+        )
     else:
         schema = Check(
             "subsystem.ephemeris.schema_compatible",
@@ -1008,7 +1055,7 @@ def ephemeris_checks(
     try:
         quick_rows = connection.execute("PRAGMA quick_check(1)").fetchall()
     except sqlite3.Error as exc:
-        if wal_unverified:
+        if wal_may_hide_committed_tail:
             integrity = Check(
                 "subsystem.ephemeris.integrity_check",
                 "ephemeris",
@@ -1034,24 +1081,37 @@ def ephemeris_checks(
             )
     else:
         passed = quick_rows == [("ok",)]
-        status = "warning" if wal_unverified else ("ok" if passed else "blocked")
-        integrity = Check(
-            "subsystem.ephemeris.integrity_check",
-            "ephemeris",
-            status,
-            f"integrity is unverified because {wal_reason}"
-            if wal_unverified
-            else "database integrity check passed"
-            if passed
-            else (
-                "database integrity check failed"
-            ),
-            ""
-            if passed and not wal_unverified
-            else wal_remediation
-            if wal_unverified
-            else "Restore the ledger from a known-good backup.",
-        )
+        if passed and wal_unverified:
+            integrity = Check(
+                "subsystem.ephemeris.integrity_check",
+                "ephemeris",
+                "warning",
+                f"integrity is unverified because {wal_reason}",
+                wal_remediation,
+            )
+        elif passed:
+            integrity = Check(
+                "subsystem.ephemeris.integrity_check",
+                "ephemeris",
+                "ok",
+                "database integrity check passed",
+            )
+        elif wal_may_hide_committed_tail:
+            integrity = Check(
+                "subsystem.ephemeris.integrity_check",
+                "ephemeris",
+                "warning",
+                f"integrity is unverified because {wal_reason}",
+                wal_remediation,
+            )
+        else:
+            integrity = Check(
+                "subsystem.ephemeris.integrity_check",
+                "ephemeris",
+                "blocked",
+                "database integrity check failed",
+                "Restore the ledger from a known-good backup.",
+            )
     finally:
         connection.close()
     return [readability, schema, integrity, _ephemeris_backup_check(root, show_paths)]
@@ -1649,7 +1709,7 @@ def _is_within(path: Path, roots: list[Path]) -> bool:
     """Reject runner candidates from any inspected code or data root."""
     try:
         candidates = {path, path.resolve(strict=True)}
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         return True
     for root in roots:
         try:
@@ -1657,9 +1717,9 @@ def _is_within(path: Path, roots: list[Path]) -> bool:
         except FileNotFoundError:
             try:
                 root_candidates = {root, root.resolve(strict=False)}
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, ValueError):
                 return True
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return True
         if any(
             candidate.is_relative_to(base)
@@ -1681,7 +1741,7 @@ def _safe_runner_path(instance_roots: list[Path]) -> tuple[str, dict[str, Path]]
     for raw in os.get_exec_path():
         try:
             entry = Path(os.path.abspath(raw or os.curdir)).expanduser()
-        except RuntimeError:
+        except (RuntimeError, ValueError):
             continue
         if not _is_within(entry, forbidden):
             entries.append(str(entry))
@@ -1720,6 +1780,7 @@ def _bounded_runner_version(
         stderr=subprocess.DEVNULL,
         env=environment,
         cwd="/",
+        start_new_session=True,
     )
     assert process.stdout is not None
     output = bytearray()
@@ -1749,18 +1810,20 @@ def _bounded_runner_version(
                 return None
     finally:
         process.stdout.close()
-        if process.poll() is None:
-            try:
-                process.terminate()
-            except OSError:
-                pass
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except OSError:
+            pass
         try:
             process.wait(timeout=0.2)
         except subprocess.TimeoutExpired:
-            try:
-                process.kill()
-            except OSError:
-                pass
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        if process.poll() is None:
+            process.kill()
         process.wait()
 
 
@@ -1852,7 +1915,7 @@ def runtime_override_check(override_value: str | None, show_paths: bool) -> Chec
         )
     try:
         path = Path(os.path.abspath(Path(override_value).expanduser()))
-    except RuntimeError:
+    except (RuntimeError, ValueError):
         return Check(
             "runtime.override_verified",
             "selfos",
@@ -1862,7 +1925,7 @@ def runtime_override_check(override_value: str | None, show_paths: bool) -> Chec
         )
     try:
         public_label = containing_public_root(path)
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         public_label = None
     if public_label is not None:
         return Check(
@@ -1887,7 +1950,7 @@ def runtime_override_check(override_value: str | None, show_paths: bool) -> Chec
         finally:
             if file_fd >= 0:
                 os.close(file_fd)
-    except OSError:
+    except (OSError, ValueError):
         return Check(
             "runtime.override_verified",
             "selfos",

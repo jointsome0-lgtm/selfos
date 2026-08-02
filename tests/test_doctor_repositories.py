@@ -166,3 +166,12 @@ def test_looping_configured_root_is_reported_without_aborting_other_checks(
     assert "invalid or unreadable" in configured.detail
     assert outside.status == "not_applicable"
     assert any(check.label != "atlas" for check in checks)
+
+
+def test_nul_instance_path_is_reported_without_crashing() -> None:
+    root, source = doctor.discover_instance("atlas", {"atlas": "\x00"})
+
+    assert root is None
+    assert source == "invalid path from user config instances.atlas"
+    checks = doctor.instance_checks("atlas", root, source, False)
+    assert check_by_id(checks, "instance.root_configured").status == "warning"

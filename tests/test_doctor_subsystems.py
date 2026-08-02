@@ -58,14 +58,19 @@ def sidecar_metadata(database: Path) -> dict[str, tuple[int, int] | None]:
 
 
 def synthetic_pending_wal(page_size: int = 512) -> bytes:
-    """Build a header and one full frame for doctor's bounded WAL probe."""
+    """Build one structurally committed frame for doctor's bounded WAL probe."""
     header = (
         (0x377F0682).to_bytes(4, "big")
         + (3_007_000).to_bytes(4, "big")
         + page_size.to_bytes(4, "big")
         + bytes(20)
     )
-    return header + bytes(doctor.SQLITE_WAL_FRAME_HEADER_BYTES + page_size)
+    frame = (
+        (1).to_bytes(4, "big")
+        + (1).to_bytes(4, "big")
+        + bytes(doctor.SQLITE_WAL_FRAME_HEADER_BYTES - 8)
+    )
+    return header + frame + bytes(page_size)
 
 
 def make_atlas(root: Path) -> Path:
@@ -356,6 +361,57 @@ def test_junk_wal_does_not_soften_corrupt_main_file_or_mutate_sidecars(
     assert sidecar_metadata(database) == sidecars_before
 
 
+def test_malformed_wal_warns_instead_of_reporting_healthy_main_as_authoritative(
+    isolated_doctor: Path,
+) -> None:
+    make_ephemeris_engine(isolated_doctor, 1)
+    root = isolated_doctor.parent / "private-malformed-wal-healthy-main"
+    database = make_database(root, 1)
+    database.with_name(database.name + "-wal").write_bytes(
+        b"J" * doctor.SQLITE_WAL_HEADER_BYTES
+    )
+    fresh_backup(root)
+
+    checks = doctor.ephemeris_checks(root, False)
+
+    for check_id in (
+        "subsystem.ephemeris.schema_compatible",
+        "subsystem.ephemeris.integrity_check",
+    ):
+        finding = by_id(checks, check_id)
+        assert finding.status == "warning"
+        assert "WAL file is malformed" in finding.detail
+
+
+def test_zeroed_wal_frame_does_not_soften_corrupt_main_file(
+    isolated_doctor: Path,
+) -> None:
+    make_ephemeris_engine(isolated_doctor, 1)
+    root = isolated_doctor.parent / "private-zero-frame-corrupt-main"
+    database = make_database(root, 1)
+    connection = sqlite3.connect(database)
+    connection.executemany(
+        "INSERT INTO fixture DEFAULT VALUES",
+        [() for _ in range(200)],
+    )
+    connection.commit()
+    page_size = connection.execute("PRAGMA page_size").fetchone()[0]
+    connection.close()
+    contents = bytearray(database.read_bytes())
+    contents[page_size : 2 * page_size] = b"X" * page_size
+    database.write_bytes(contents)
+    header = synthetic_pending_wal(page_size)[: doctor.SQLITE_WAL_HEADER_BYTES]
+    database.with_name(database.name + "-wal").write_bytes(
+        header + bytes(doctor.SQLITE_WAL_FRAME_HEADER_BYTES + page_size)
+    )
+    fresh_backup(root)
+
+    checks = doctor.ephemeris_checks(root, False)
+
+    assert by_id(checks, "subsystem.ephemeris.schema_compatible").status == "warning"
+    assert by_id(checks, "subsystem.ephemeris.integrity_check").status == "blocked"
+
+
 def test_valid_wal_header_with_full_frame_always_uses_immutable_connection(
     isolated_doctor: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -435,7 +491,9 @@ def test_failed_integrity_with_wal_is_warning(
     checks = doctor.ephemeris_checks(root, False)
     integrity = by_id(checks, "subsystem.ephemeris.integrity_check")
     assert integrity.status == "warning"
-    assert integrity.detail == "integrity is unverified because the WAL tail is not visible"
+    assert integrity.detail == (
+        "integrity is unverified because the committed WAL tail is not visible"
+    )
     assert uris[0].endswith("?mode=ro&immutable=1")
     assert sidecar_metadata(database) == sidecars_before
 

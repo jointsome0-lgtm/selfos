@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -171,6 +172,43 @@ def test_override_fifo_without_writer_is_rejected_without_blocking(
     assert finding.status == "warning"
     assert finding.detail == "configured runtime override is missing or unreadable"
     assert elapsed < 1
+
+
+def test_nul_override_path_warns_without_crashing() -> None:
+    finding = doctor.runtime_override_check("\x00", False)
+
+    assert finding.status == "warning"
+    assert finding.detail == "configured runtime override is missing or unreadable"
+
+
+def test_runner_timeout_terminates_descendants(
+    isolated_doctor: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = isolated_doctor.parent / "runner-descendant"
+    survived = isolated_doctor.parent / "runner-descendant-survived"
+    child = (
+        "import time; from pathlib import Path; time.sleep(0.4); "
+        f"Path({str(survived)!r}).write_text('survived')"
+    )
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+        "print('codex 1.0', flush=True)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    monkeypatch.setattr(doctor, "RUNNER_VERSION_TIMEOUT_SECONDS", 0.1)
+
+    result = doctor._bounded_runner_version(
+        executable,
+        {"PATH": "/usr/bin", "LANG": "C", "LC_ALL": "C", "NO_COLOR": "1"},
+    )
+    time.sleep(0.5)
+
+    assert result is None
+    assert not survived.exists()
 
 
 @pytest.mark.parametrize("failure", ["budget", "timeout"])
