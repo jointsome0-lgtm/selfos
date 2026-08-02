@@ -9,6 +9,9 @@ from pathlib import Path
 from scripts import doctor
 
 
+SAFE_RUNNER_PATH = doctor._safe_runner_path
+
+
 def by_id(checks: list[doctor.Check], check_id: str) -> doctor.Check:
     """Select the single runtime result promised by each public ID."""
     return next(check for check in checks if check.id == check_id)
@@ -66,6 +69,25 @@ def test_unparseable_runner_output_warns_without_echo(
     finding = by_id(doctor.runtime_runner_checks([]), "runtime.runner_version")
     assert finding.status == "warning"
     assert secret not in finding.detail
+
+
+def test_runner_inside_sibling_checkout_is_not_resolved(
+    isolated_doctor: Path, monkeypatch
+) -> None:
+    executable = isolated_doctor.parent / "atlas" / "bin" / "codex"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setattr(doctor, "_safe_runner_path", SAFE_RUNNER_PATH)
+    monkeypatch.setattr(
+        doctor.os,
+        "get_exec_path",
+        lambda: [str(executable.parent)],
+    )
+
+    search_path, found = doctor._safe_runner_path([])
+    assert search_path == ""
+    assert found == {}
 
 
 def test_stale_override_reports_only_date_and_age(isolated_doctor: Path) -> None:

@@ -7,6 +7,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+import pytest
+
 from scripts import doctor
 
 
@@ -87,7 +89,9 @@ def test_unopenable_database_error_is_summarised_without_path(
     assert "private-unopenable-marker" not in finding.detail
 
 
-def test_busy_database_is_transient_warning(isolated_doctor: Path) -> None:
+def test_busy_database_does_not_block_immutable_inspection(
+    isolated_doctor: Path,
+) -> None:
     root = isolated_doctor.parent / "private-busy"
     database = make_database(root, 1)
     fresh_backup(root)
@@ -99,8 +103,78 @@ def test_busy_database_is_transient_warning(isolated_doctor: Path) -> None:
         writer.rollback()
         writer.close()
     readable = by_id(checks, "subsystem.ephemeris.database_readable")
-    assert readable.status == "warning"
-    assert "could not be checked now" in readable.detail
+    assert readable.status != "blocked"
+
+
+def test_wal_database_inspection_creates_no_sidecar_or_directory_entry(
+    isolated_doctor: Path,
+) -> None:
+    make_ephemeris_engine(isolated_doctor, 1)
+    source = isolated_doctor.parent / "wal-source"
+    source_database = make_database(source, 1)
+    writer = sqlite3.connect(source_database)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("INSERT INTO fixture DEFAULT VALUES")
+    writer.commit()
+    try:
+        root = isolated_doctor.parent / "private-wal-copy"
+        root.mkdir()
+        database = root / "activity.sqlite"
+        wal = database.with_name(database.name + "-wal")
+        database.write_bytes(source_database.read_bytes())
+        wal.write_bytes(
+            source_database.with_name(source_database.name + "-wal").read_bytes()
+        )
+        fresh_backup(root)
+        before = {entry.name for entry in root.iterdir()}
+
+        checks = doctor.ephemeris_checks(root, False)
+
+        assert {entry.name for entry in root.iterdir()} == before
+        assert wal.exists()
+        assert not database.with_name(database.name + "-shm").exists()
+        readable = by_id(checks, "subsystem.ephemeris.database_readable")
+        assert readable.status == "ok"
+        assert "pending WAL writes are not visible" in readable.detail
+    finally:
+        writer.close()
+
+
+def test_failed_integrity_with_wal_is_warning(
+    isolated_doctor: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = isolated_doctor.parent / "private-pending-writes"
+    database = make_database(root, 1)
+    database.with_name(database.name + "-wal").write_bytes(b"fixture")
+    fresh_backup(root)
+
+    class UserVersion:
+        def fetchone(self):
+            return (1,)
+
+    class FailingQuickCheck:
+        def execute(self, statement):
+            if statement == "PRAGMA user_version":
+                return UserVersion()
+            raise sqlite3.DatabaseError("fixture failure")
+
+        def close(self):
+            return None
+
+    uris: list[str] = []
+
+    def connect(database_uri, **_kwargs):
+        uris.append(database_uri)
+        return FailingQuickCheck()
+
+    monkeypatch.setattr(doctor.sqlite3, "connect", connect)
+    checks = doctor.ephemeris_checks(root, False)
+    integrity = by_id(checks, "subsystem.ephemeris.integrity_check")
+    assert integrity.status == "warning"
+    assert integrity.detail == (
+        "integrity could not be verified while writes are pending"
+    )
+    assert uris[0].endswith("?mode=ro&immutable=1")
 
 
 def test_newer_and_older_database_versions_have_required_severity(
@@ -146,6 +220,57 @@ def test_old_or_absent_backup_warns(isolated_doctor: Path) -> None:
     old = time.time() - 9 * 86400
     os.utime(snapshot, (old, old))
     assert doctor._ephemeris_backup_check(root, False).status == "warning"
+
+
+def test_backup_freshness_ignores_directories_fifos_and_symlinks(
+    isolated_doctor: Path,
+) -> None:
+    root = isolated_doctor.parent / "private-special-backups"
+    backups = root / "backups"
+    backups.mkdir(parents=True)
+    stale = backups / "stale.backup"
+    stale.write_bytes(b"")
+    old = time.time() - 9 * 86400
+    os.utime(stale, (old, old))
+    (backups / "new-directory").mkdir()
+    os.mkfifo(backups / "new-fifo")
+    target = root / "new-target"
+    target.write_bytes(b"")
+    (backups / "new-symlink").symlink_to(target)
+
+    stale_finding = doctor._ephemeris_backup_check(root, False)
+    assert stale_finding.status == "warning"
+    assert "9 whole days old" in stale_finding.detail
+
+    stale.unlink()
+    absent_finding = doctor._ephemeris_backup_check(root, False)
+    assert absent_finding.status == "warning"
+    assert absent_finding.detail == "no backups are available"
+
+
+def test_activity_db_override_inside_public_checkout_is_not_opened(
+    isolated_doctor: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = isolated_doctor.parent / "private-activity-root"
+    root.mkdir()
+    public_database = make_database(isolated_doctor / "fixture", 1)
+    monkeypatch.setenv("ACTIVITY_DB", str(public_database))
+
+    def reject_open(*_args, **_kwargs):
+        pytest.fail("public-checkout database must not be opened")
+
+    monkeypatch.setattr(doctor.sqlite3, "connect", reject_open)
+    checks = doctor.ephemeris_checks(root, False)
+    readable = by_id(checks, "subsystem.ephemeris.database_readable")
+    assert readable.status == "blocked"
+    assert "public checkout" in readable.detail
+    assert "fixture" not in readable.detail
+    assert by_id(checks, "subsystem.ephemeris.schema_compatible").status == (
+        "not_applicable"
+    )
+    assert by_id(checks, "subsystem.ephemeris.integrity_check").status == (
+        "not_applicable"
+    )
 
 
 def test_atlas_writer_lock_is_warning_and_is_not_removed(
@@ -199,6 +324,42 @@ def test_interrupted_intake_reports_count_without_key(isolated_doctor: Path) -> 
     assert "1 intake keys" in finding.detail
     assert "private-key" not in finding.detail
     assert sum(check.status == "warning" for check in checks) == 1
+
+
+def test_later_opened_receipt_supersedes_earlier_processed(
+    isolated_doctor: Path,
+) -> None:
+    root = make_atlas(isolated_doctor.parent / "atlas-latest-receipt")
+    (root / "state" / "receipts.jsonl").write_text(
+        '{"intake":"private-latest-key","marker":"processed"}\n'
+        '{"intake":"private-latest-key","marker":"opened"}\n',
+        encoding="utf-8",
+    )
+    finding = by_id(
+        doctor.atlas_checks(root, False),
+        "subsystem.atlas.receipts_complete",
+    )
+    assert finding.status == "warning"
+    assert "1 intake keys" in finding.detail
+    assert "private-latest-key" not in finding.detail
+
+
+def test_processed_receipt_without_prior_opened_is_not_silently_clean(
+    isolated_doctor: Path,
+) -> None:
+    root = make_atlas(isolated_doctor.parent / "atlas-orphan-processed")
+    (root / "state" / "receipts.jsonl").write_text(
+        '{"intake":"private-orphan-key","marker":"processed"}\n',
+        encoding="utf-8",
+    )
+    finding = by_id(
+        doctor.atlas_checks(root, False),
+        "subsystem.atlas.receipts_complete",
+    )
+    assert finding.status == "warning"
+    assert "1 intake keys" in finding.detail
+    assert "without a preceding opened receipt" in finding.detail
+    assert "private-orphan-key" not in finding.detail
 
 
 def test_guessed_receipt_field_names_are_not_applicable(
@@ -299,6 +460,47 @@ def test_journal_byte_cap_is_warning_not_failure(
     finding = by_id(doctor.atlas_checks(root, False), "subsystem.atlas.journals_parse")
     assert finding.status == "warning"
     assert "not fully checked" in finding.detail
+
+
+def test_aggregate_receipt_byte_cap_warns_and_skips_completeness(
+    isolated_doctor: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = make_atlas(isolated_doctor.parent / "atlas-receipt-byte-budget")
+    rotated = root / "state" / "receipts"
+    rotated.mkdir()
+    first = b'{"intake":"fixture-key","marker":"opened"}\n'
+    tail = b'{"intake":"fixture-key","marker":"processed"}\n'
+    (rotated / "0001.jsonl").write_bytes(first)
+    (root / "state" / "receipts.jsonl").write_bytes(tail)
+    monkeypatch.setattr(
+        doctor,
+        "ATLAS_MAX_RECEIPT_BYTES",
+        max(len(first), len(tail)),
+    )
+
+    checks = doctor.atlas_checks(root, False)
+    assert by_id(checks, "subsystem.atlas.journals_parse").status == "warning"
+    assert by_id(checks, "subsystem.atlas.receipts_complete").status == (
+        "not_applicable"
+    )
+
+
+def test_aggregate_receipt_key_cap_warns_and_skips_completeness(
+    isolated_doctor: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = make_atlas(isolated_doctor.parent / "atlas-receipt-key-budget")
+    (root / "state" / "receipts.jsonl").write_text(
+        '{"intake":"fixture-key-one","marker":"opened"}\n'
+        '{"intake":"fixture-key-two","marker":"opened"}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(doctor, "ATLAS_MAX_RECEIPT_KEYS", 1)
+
+    checks = doctor.atlas_checks(root, False)
+    assert by_id(checks, "subsystem.atlas.journals_parse").status == "warning"
+    assert by_id(checks, "subsystem.atlas.receipts_complete").status == (
+        "not_applicable"
+    )
 
 
 def test_absent_subsystem_subjects_are_all_not_applicable() -> None:
