@@ -81,14 +81,15 @@ intelligence number.
   workspace-write` when it must edit files OR run tests/builds — test
   runs write caches and temp state, so read-only makes them fail or
   stall (this produced a false "verify.py hangs" finding once).
-- Effort sizing (2026-07-19): the xhigh config default is for full
-  adversarial/design passes only — open-ended search where a missed
-  defect costs more than the hours. Scoped real work — implementing
-  from a clear spec, diagnosing a named bug, reviewing a medium diff,
-  prep/measurement tasks — gets `-c model_reasoning_effort=high`.
-  Routine bounded checks — verifying a small diff, fidelity/gate
-  checks, health checks — get medium (trivial/relay: low); xhigh on a
-  42-line diff wastes ~10× wall-time for no extra findings.
+- Effort sizing (2026-07-19, capped by the 2026-07-30 ceiling above):
+  every run passes `-c model_reasoning_effort=...` explicitly, because
+  the config default sits above the ceiling. Full adversarial/design
+  passes and scoped real work — implementing from a clear spec,
+  diagnosing a named bug, reviewing a medium diff, prep/measurement
+  tasks — get `high`. Routine bounded checks — verifying a small diff,
+  fidelity/gate checks, health checks — get medium (trivial/relay:
+  low); xhigh on a 42-line diff wastes ~10× wall-time for no extra
+  findings.
 - Parallel codex execs are fragile here (S8 2026-07-16: a run hung
   ~35 min behind parallel sessions) — prefer one lighter run over a
   fan-out; whole-diff consistency doesn't decompose per-finding anyway.
