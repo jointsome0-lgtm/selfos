@@ -323,6 +323,8 @@ def test_cli_writes_payload_and_prints_report(tmp_path, capsys):
         encoding="utf-8",
     )
     output = tmp_path / "retro-191.jsonl"
+    output.write_text("", encoding="utf-8")
+    output.chmod(0o644)
     exit_code = retro_adapter.main(
         [
             str(export),

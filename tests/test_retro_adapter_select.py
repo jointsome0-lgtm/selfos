@@ -219,6 +219,25 @@ def test_config_file_root_is_honored(tmp_path, monkeypatch):
         retro_adapter.configured_private_root()
 
 
+def test_every_discovery_source_expands_a_home_relative_root(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    workspace = tmp_path / "vera-workspace"
+    assert (
+        retro_adapter.configured_private_root("~/vera-workspace") == workspace
+    )
+    monkeypatch.setenv("EXP2RES_WORKSPACE", "~/vera-workspace")
+    assert retro_adapter.configured_private_root() == workspace
+    monkeypatch.delenv("EXP2RES_WORKSPACE")
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[instances]\nexp2res = "~/vera-workspace"\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(retro_adapter, "CONFIG_PATH", config)
+    assert retro_adapter.configured_private_root() == workspace
+
+
 def test_cli_refuses_overwriting_the_export(tmp_path, capsys):
     export = tmp_path / "events-export.jsonl"
     export.write_text(

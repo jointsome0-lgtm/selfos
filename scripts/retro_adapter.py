@@ -275,15 +275,16 @@ def configured_private_root(explicit: str | None = None) -> Path | None:
     """The exp2res private root, by the docs/instance.md discovery order.
 
     The explicit ``--instance`` flag first, then ``EXP2RES_WORKSPACE``,
-    then ``instances.exp2res`` in the user config. A config that exists
+    then ``instances.exp2res`` in the user config. Every source is
+    ``~``-expanded, matching doctor's discovery. A config that exists
     but cannot be read or parsed refuses the run rather than silently
     weakening the output boundary.
     """
     if explicit:
-        return Path(explicit)
+        return Path(explicit).expanduser()
     value = os.environ.get(ENV_VAR)
     if value:
-        return Path(value)
+        return Path(value).expanduser()
     if not CONFIG_PATH.is_file():
         return None
     try:
@@ -306,7 +307,7 @@ def configured_private_root(explicit: str | None = None) -> Path | None:
     configured = instances.get("exp2res")
     if not isinstance(configured, str) or not configured:
         return None
-    return Path(configured)
+    return Path(configured).expanduser()
 
 
 def _public_roots() -> list[Path]:
@@ -456,8 +457,10 @@ def main(argv: list[str] | None = None) -> int:
             args.output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
         )
         with os.fdopen(fd, "wb") as handle:
+            # An existing destination keeps its old mode through os.open;
+            # restrict the descriptor before any payload byte is written.
+            os.fchmod(handle.fileno(), 0o600)
             handle.write(body)
-        os.chmod(args.output, 0o600)
     except (OSError, UnicodeError) as exc:
         print(f"error: cannot write output: {exc}", file=sys.stderr)
         return 2
