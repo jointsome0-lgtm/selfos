@@ -135,6 +135,40 @@ def test_contradictory_archive_transition_is_rejected():
     ] == [("uuid-a", "invalid_snapshot"), ("uuid-b", "invalid_snapshot")]
 
 
+def test_non_string_archive_marker_is_schema_corruption_not_archived():
+    records, report = run(
+        export_line("retro_entry_archived", snapshot("uuid-a", archived_at=42))
+    )
+    assert records == []
+    assert report["skipped"] == []
+    assert [
+        (entry["retro_uuid"], entry["reason"]) for entry in report["rejected"]
+    ] == [("uuid-a", "invalid_snapshot")]
+
+
+def test_report_stays_printable_with_an_unencodable_identifier(tmp_path, capsys):
+    export = tmp_path / "events-export.jsonl"
+    event = {
+        "timestamp": "2026-05-02T10:00:00+02:00",
+        "type": "retro_entry_created",
+        "payload_version": 1,
+        "payload": snapshot("uuid-\ud800"),
+    }
+    export.write_text(json.dumps(event) + "\n", encoding="utf-8")
+    output = tmp_path / "vera-out.jsonl"
+    exit_code = retro_adapter.main(
+        [str(export), "--timezone", TIMEZONE, "-o", str(output)]
+    )
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert out.isascii()
+    report = json.loads(out)
+    assert [entry["reason"] for entry in report["rejected"]] == [
+        "text_not_encodable"
+    ]
+    assert output.read_bytes() == b""
+
+
 def test_non_string_project_is_schema_corruption_not_no_project():
     records, report = run(
         export_line("retro_entry_created", snapshot("uuid-a", project=42)),

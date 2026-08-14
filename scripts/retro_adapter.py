@@ -119,7 +119,12 @@ def select_snapshots(text: str) -> Selection:
         if event["type"] not in RETRO_EVENT_TYPES:
             ignored += 1
             continue
-        if event.get("payload_version") != SUPPORTED_PAYLOAD_VERSION:
+        version = event.get("payload_version")
+        if (
+            not isinstance(version, int)
+            or isinstance(version, bool)
+            or version != SUPPORTED_PAYLOAD_VERSION
+        ):
             retro_uuid = _payload_uuid(event)
             if retro_uuid is None:
                 rejected.append(
@@ -180,7 +185,11 @@ def build_records(
             "retro_uuid": retro_uuid,
             "record_id": RECORD_ID_PREFIX + retro_uuid,
         }
-        archived = snapshot.get("archived_at") is not None
+        archived_at = snapshot.get("archived_at")
+        if archived_at is not None and not isinstance(archived_at, str):
+            rejected.append({**identity, "reason": "invalid_snapshot"})
+            continue
+        archived = archived_at is not None
         event_type = selection.latest_types[retro_uuid]
         if (event_type == "retro_entry_archived" and not archived) or (
             event_type == "retro_entry_unarchived" and archived
@@ -395,7 +404,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, UnicodeError) as exc:
         print(f"error: cannot write output: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    print(json.dumps(report, indent=2))
     return 0
 
 

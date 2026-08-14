@@ -138,6 +138,21 @@ def test_poisoned_identity_stays_rejected_after_a_later_valid_event():
     assert [entry["retro_uuid"] for entry in selection.rejected_entries] == ["uuid-a"]
 
 
+def test_version_gate_requires_the_exact_integer_wire_type():
+    text = "\n".join(
+        [
+            export_line("retro_entry_created", snapshot("uuid-a"), version=True),
+            export_line("retro_entry_created", snapshot("uuid-b"), version=1.0),
+        ]
+    )
+    selection = retro_adapter.select_snapshots(text)
+    assert selection.snapshots == {}
+    assert [entry["retro_uuid"] for entry in selection.rejected_entries] == [
+        "uuid-a",
+        "uuid-b",
+    ]
+
+
 def test_unsupported_version_without_identity_is_rejected_per_line():
     text = export_line("retro_entry_created", {"note": "no uuid"}, version=2)
     selection = retro_adapter.select_snapshots(text)
