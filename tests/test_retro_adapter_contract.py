@@ -157,7 +157,14 @@ def test_report_stays_printable_with_an_unencodable_identifier(tmp_path, capsys)
     export.write_text(json.dumps(event) + "\n", encoding="utf-8")
     output = tmp_path / "vera-out.jsonl"
     exit_code = retro_adapter.main(
-        [str(export), "--timezone", TIMEZONE, "-o", str(output)]
+        [
+            str(export),
+            "--timezone",
+            TIMEZONE,
+            "-o",
+            str(output),
+            "--allow-unconfigured",
+        ]
     )
     assert exit_code == 0
     out = capsys.readouterr().out
@@ -292,9 +299,17 @@ def test_cli_writes_payload_and_prints_report(tmp_path, capsys):
     )
     output = tmp_path / "retro-191.jsonl"
     exit_code = retro_adapter.main(
-        [str(export), "--timezone", TIMEZONE, "-o", str(output)]
+        [
+            str(export),
+            "--timezone",
+            TIMEZONE,
+            "-o",
+            str(output),
+            "--allow-unconfigured",
+        ]
     )
     assert exit_code == 0
+    assert output.stat().st_mode & 0o777 == 0o600
     lines = output.read_text(encoding="utf-8").splitlines()
     assert [json.loads(line)["record_id"] for line in lines] == [
         "ephemeris:retro:uuid-a"

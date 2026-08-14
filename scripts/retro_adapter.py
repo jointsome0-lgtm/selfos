@@ -62,10 +62,11 @@ def _time_grammar():
     try:
         from exp2res.errors import Exp2ResError
         from exp2res.services.time_input import parse_occurred, workspace_zone
-    except ModuleNotFoundError as exc:
+    except ImportError as exc:
         raise AdapterError(
-            "the exp2res package must be importable (install it or add its "
-            "checkout to PYTHONPATH); occurred resolution uses its grammar"
+            "the exp2res package must be importable and expose its time "
+            "grammar (install a compatible revision or add its checkout to "
+            "PYTHONPATH); occurred resolution uses that grammar"
         ) from exc
     return parse_occurred, workspace_zone, Exp2ResError
 
@@ -96,7 +97,9 @@ def select_snapshots(text: str) -> Selection:
 
     An identity that carries any event with an unsupported payload version
     is rejected whole: its latest state is unreadable, so no earlier
-    snapshot may stand in for it. Line numbers are physical (blank lines
+    snapshot may stand in for it. A retro event with no attributable
+    ``retro_uuid`` refuses the whole run for the same reason, with no
+    identity to pin the damage to. Line numbers are physical (blank lines
     count, matching a text editor); non-retro event types are counted,
     never reported per line.
     """
@@ -119,33 +122,27 @@ def select_snapshots(text: str) -> Selection:
         if event["type"] not in RETRO_EVENT_TYPES:
             ignored += 1
             continue
+        retro_uuid = _payload_uuid(event)
+        if retro_uuid is None:
+            raise AdapterError(
+                f"line {number}: a retro event carries no attributable "
+                "retro_uuid; refusing the whole export, because an "
+                "unattributable lifecycle event could hide an edit or "
+                "archive of some entry"
+            )
         version = event.get("payload_version")
         if (
             not isinstance(version, int)
             or isinstance(version, bool)
             or version != SUPPORTED_PAYLOAD_VERSION
         ):
-            retro_uuid = _payload_uuid(event)
-            if retro_uuid is None:
-                rejected.append(
-                    {"line": number, "reason": "unsupported_payload_version"}
-                )
-            else:
-                poisoned.setdefault(retro_uuid)
-                snapshots.pop(retro_uuid, None)
-                latest_types.pop(retro_uuid, None)
-            continue
-        payload = event.get("payload")
-        if not isinstance(payload, dict):
-            rejected.append({"line": number, "reason": "payload_not_object"})
-            continue
-        retro_uuid = payload.get("retro_uuid")
-        if not isinstance(retro_uuid, str) or not retro_uuid:
-            rejected.append({"line": number, "reason": "missing_retro_uuid"})
+            poisoned.setdefault(retro_uuid)
+            snapshots.pop(retro_uuid, None)
+            latest_types.pop(retro_uuid, None)
             continue
         if retro_uuid in poisoned:
             continue
-        snapshots[retro_uuid] = payload
+        snapshots[retro_uuid] = event["payload"]
         latest_types[retro_uuid] = event["type"]
     rejected_entries = [
         {
@@ -283,10 +280,10 @@ def configured_private_root() -> Path | None:
         return None
     try:
         import tomllib
-    except ModuleNotFoundError:
+    except ImportError:
         try:
             import tomli as tomllib
-        except ModuleNotFoundError as exc:
+        except ImportError as exc:
             raise AdapterError(
                 f"{CONFIG_PATH} exists but no TOML parser is available; "
                 "run under Python 3.11+ or install tomli"
@@ -324,17 +321,19 @@ def _refuse_inside_public(path: Path, resolved: Path, role: str) -> None:
             )
 
 
-def refuse_unsafe_paths(output: Path, export: Path) -> None:
+def refuse_unsafe_paths(
+    output: Path, export: Path, *, allow_unconfigured: bool = False
+) -> None:
     """Adapters operate only on private instance paths (AGENTS.md, docs/instance.md).
 
     Neither the export nor the output may resolve inside a public engine
     checkout the AGENTS.md map names. When an exp2res private root is
     configured (``EXP2RES_WORKSPACE`` or ``instances.exp2res`` in the user
     config), the output must additionally resolve inside it; with no root
-    configured — capture is still blocked by design, so only invented-data
-    runs exist — the deny set is the whole boundary. The export is never
-    required to sit inside an ephemeris root: ephemeris delivers exports
-    as browser downloads. The export is also refused as the output
+    configured the run is refused unless ``allow_unconfigured`` explicitly
+    marks it an invented-data run to a private destination. The export is
+    never required to sit inside an ephemeris root: ephemeris delivers
+    exports as browser downloads. The export is also refused as the output
     destination, through symlink and hard-link aliases alike, so a typo
     cannot truncate the source.
     """
@@ -350,9 +349,16 @@ def refuse_unsafe_paths(output: Path, export: Path) -> None:
         )
     _refuse_inside_public(export, resolved_export, "export")
     private_root = configured_private_root()
-    if private_root is not None and not resolved_output.is_relative_to(
-        private_root.resolve()
-    ):
+    if private_root is None:
+        if not allow_unconfigured:
+            raise AdapterError(
+                "no exp2res private root is configured (EXP2RES_WORKSPACE "
+                "or instances.exp2res in the user config) and the adapter "
+                "cannot tell personal data from fixtures; configure the "
+                "root, or pass --allow-unconfigured only for an "
+                "invented-data run to a private destination"
+            )
+    elif not resolved_output.is_relative_to(private_root.resolve()):
         raise AdapterError(
             f"output path {output} is outside the configured exp2res "
             f"private root {private_root}; write the payload there "
@@ -380,9 +386,21 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="destination for the §19.1 JSONL payload",
     )
+    parser.add_argument(
+        "--allow-unconfigured",
+        action="store_true",
+        help=(
+            "run without a configured exp2res private root; only for "
+            "invented-data runs writing to a private destination"
+        ),
+    )
     args = parser.parse_args(argv)
     try:
-        refuse_unsafe_paths(Path(args.output), Path(args.export_path))
+        refuse_unsafe_paths(
+            Path(args.output),
+            Path(args.export_path),
+            allow_unconfigured=args.allow_unconfigured,
+        )
     except AdapterError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -400,7 +418,12 @@ def main(argv: list[str] | None = None) -> int:
         body = "".join(
             json.dumps(r, ensure_ascii=False) + "\n" for r in records
         ).encode("utf-8")
-        Path(args.output).write_bytes(body)
+        fd = os.open(
+            args.output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+        )
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(body)
+        os.chmod(args.output, 0o600)
     except (OSError, UnicodeError) as exc:
         print(f"error: cannot write output: {exc}", file=sys.stderr)
         return 2

@@ -153,13 +153,16 @@ def test_version_gate_requires_the_exact_integer_wire_type():
     ]
 
 
-def test_unsupported_version_without_identity_is_rejected_per_line():
-    text = export_line("retro_entry_created", {"note": "no uuid"}, version=2)
-    selection = retro_adapter.select_snapshots(text)
-    assert selection.rejected_lines == [
-        {"line": 1, "reason": "unsupported_payload_version"}
-    ]
-    assert selection.rejected_entries == []
+def test_unattributable_retro_event_refuses_the_whole_run():
+    for payload in ({"note": "no uuid"}, snapshot(""), "not an object"):
+        text = "\n".join(
+            [
+                export_line("retro_entry_created", snapshot("uuid-a")),
+                export_line("retro_entry_updated", payload),
+            ]
+        )
+        with pytest.raises(retro_adapter.AdapterError):
+            retro_adapter.select_snapshots(text)
 
 
 def test_cli_refuses_output_inside_a_public_checkout(tmp_path, capsys):
@@ -171,7 +174,14 @@ def test_cli_refuses_output_inside_a_public_checkout(tmp_path, capsys):
     public_root = Path(retro_adapter.__file__).resolve().parents[1]
     output = public_root / "vera-payload.jsonl"
     exit_code = retro_adapter.main(
-        [str(export), "--timezone", "Europe/Berlin", "-o", str(output)]
+        [
+            str(export),
+            "--timezone",
+            "Europe/Berlin",
+            "-o",
+            str(output),
+            "--allow-unconfigured",
+        ]
     )
     assert exit_code == 2
     assert not output.exists()
@@ -270,24 +280,25 @@ def test_cli_refuses_an_undecodable_export(tmp_path, capsys):
             "Europe/Berlin",
             "-o",
             str(tmp_path / "vera-out.jsonl"),
+            "--allow-unconfigured",
         ]
     )
     assert exit_code == 2
     assert "cannot read export" in capsys.readouterr().err
 
 
-def test_retro_event_without_retro_uuid_is_rejected():
-    payload = snapshot("uuid-a")
-    del payload["retro_uuid"]
-    text = "\n".join(
-        [
-            export_line("retro_entry_created", payload),
-            export_line("retro_entry_created", snapshot("")),
-        ]
+def test_cli_refuses_an_unconfigured_run_without_the_optin_flag(
+    tmp_path, capsys
+):
+    export = tmp_path / "events-export.jsonl"
+    export.write_text(
+        export_line("retro_entry_created", snapshot("uuid-a")) + "\n",
+        encoding="utf-8",
     )
-    selection = retro_adapter.select_snapshots(text)
-    assert selection.snapshots == {}
-    assert [entry["reason"] for entry in selection.rejected_lines] == [
-        "missing_retro_uuid",
-        "missing_retro_uuid",
-    ]
+    output = tmp_path / "vera-out.jsonl"
+    exit_code = retro_adapter.main(
+        [str(export), "--timezone", "Europe/Berlin", "-o", str(output)]
+    )
+    assert exit_code == 2
+    assert "EXP2RES_WORKSPACE" in capsys.readouterr().err
+    assert not output.exists()

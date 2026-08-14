@@ -29,14 +29,16 @@ are explicit. When an exp2res private root is configured
 `~/.config/selfos/config.toml` — the [instance.md](instance.md)
 discovery order), the `-o` path must resolve inside that root: adapters
 operate only on explicitly configured private-instance paths. With no
-root configured — real capture is still blocked by design, so only
-invented-data runs exist — the adapter still refuses an `-o` path
-inside any public engine checkout the AGENTS.md map names, or onto the
-export itself (symlink and hard-link aliases included). The export is
-likewise refused as a source when it resolves inside a public checkout;
-it is not required to sit inside an ephemeris root, because ephemeris
-delivers exports as browser downloads. Once the import report is
-confirmed the owner deletes
+root configured the run is refused outright — the adapter cannot tell
+personal data from fixtures — unless `--allow-unconfigured` explicitly
+marks it an invented-data run to a private destination; even then an
+`-o` path inside any public engine checkout the AGENTS.md map names is
+refused, as is output onto the export itself (symlink and hard-link
+aliases included). The export is likewise refused as a source when it
+resolves inside a public checkout; it is not required to sit inside an
+ephemeris root, because ephemeris delivers exports as browser
+downloads. The payload is written with owner-only permissions (`0600`).
+Once the import report is confirmed the owner deletes
 the payload file — it is a transient handoff artifact, not a second
 store, and nothing else retains shipped entry text outside the
 receiving workspace.
@@ -99,6 +101,14 @@ never per edit.
 - Rerunning adapter + import over an unchanged export converges: the
   adapter output is byte-identical and §19.4 counts every record as a
   `duplicate` no-op.
+- Archival after delivery does not propagate. §19.1 declares no
+  tombstone record and exp2res imports are additive, so an entry that
+  was imported and later archived in ephemeris stays in exp2res as
+  delivered. The adapter is stateless by the no-copy rule and cannot
+  know what was delivered; it surfaces the divergence instead — the
+  report's `skipped: archived` entries carry the `record_id`, which
+  equals the exp2res `source_record_id` metadata, and removing
+  already-delivered evidence is the owner's exp2res deletion flow.
 
 ## Report reason codes
 
@@ -109,8 +119,13 @@ never per edit.
 | rejected | `period_unparsable:<code>` | exp2res grammar refused `period_raw` (grammar drift) |
 | rejected | `invalid_snapshot` | snapshot field types are not the sec33 wire shape (a non-string `project` included), or the latest event's archive transition contradicts its own snapshot (`retro_entry_archived` without `archived_at`, `retro_entry_unarchived` with it) |
 | rejected | `text_not_encodable` | the record cannot be encoded as UTF-8 (e.g. an unpaired surrogate in a corrupted export) |
-| rejected | `unsupported_payload_version` | some event of this identity carries an unknown `payload_version`; the whole entry is rejected (per line only when the line names no identity) |
-| rejected | `payload_not_object`, `missing_retro_uuid`, `line_not_json`, `line_not_event` | malformed export line (reported with its physical line number) |
+| rejected | `unsupported_payload_version` | some event of this identity carries a `payload_version` that is not exactly the integer `1`; the whole entry is rejected |
+| rejected | `line_not_json`, `line_not_event` | malformed export line (reported with its physical line number) |
+
+A retro event whose payload carries no attributable `retro_uuid`
+refuses the whole run: with no identity to pin the damage to, an
+unattributable lifecycle event could hide an edit or archive of any
+entry.
 
 Deterministic only: no model call, no network, no persistent state, and
 entry text cannot alter behaviour. Requires the `exp2res` package to be
