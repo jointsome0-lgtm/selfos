@@ -120,6 +120,21 @@ def test_entry_without_project_is_skipped_never_invented():
     ]
 
 
+def test_contradictory_archive_transition_is_rejected():
+    records, report = run(
+        export_line("retro_entry_archived", snapshot("uuid-a", archived_at=None)),
+        export_line(
+            "retro_entry_unarchived",
+            snapshot("uuid-b", archived_at="2026-05-03T09:00:00+02:00"),
+        ),
+        export_line("retro_entry_created", snapshot("uuid-c")),
+    )
+    assert [r["record_id"] for r in records] == ["ephemeris:retro:uuid-c"]
+    assert [
+        (entry["retro_uuid"], entry["reason"]) for entry in report["rejected"]
+    ] == [("uuid-a", "invalid_snapshot"), ("uuid-b", "invalid_snapshot")]
+
+
 def test_unknown_precision_resolves_to_an_open_occurred():
     records, _ = run(
         export_line(

@@ -47,6 +47,7 @@ RETRO_EVENT_TYPES = frozenset(
 )
 SUPPORTED_PAYLOAD_VERSION = 1
 RECORD_ID_PREFIX = "ephemeris:retro:"
+PUBLIC_SIBLINGS = ("ephemeris", "atlas", "exp2res", "tollgate", "selfos-skills")
 
 
 class AdapterError(RuntimeError):
@@ -70,6 +71,7 @@ class Selection:
     """The retro slice of one export: latest snapshot per entry."""
 
     snapshots: dict[str, dict]
+    latest_types: dict[str, str]
     rejected_lines: list[dict]
     rejected_entries: list[dict]
     ignored_lines: int
@@ -95,6 +97,7 @@ def select_snapshots(text: str) -> Selection:
     never reported per line.
     """
     snapshots: dict[str, dict] = {}
+    latest_types: dict[str, str] = {}
     poisoned: dict[str, None] = {}
     rejected: list[dict] = []
     ignored = 0
@@ -121,6 +124,7 @@ def select_snapshots(text: str) -> Selection:
             else:
                 poisoned.setdefault(retro_uuid)
                 snapshots.pop(retro_uuid, None)
+                latest_types.pop(retro_uuid, None)
             continue
         payload = event.get("payload")
         if not isinstance(payload, dict):
@@ -133,6 +137,7 @@ def select_snapshots(text: str) -> Selection:
         if retro_uuid in poisoned:
             continue
         snapshots[retro_uuid] = payload
+        latest_types[retro_uuid] = event["type"]
     rejected_entries = [
         {
             "retro_uuid": retro_uuid,
@@ -143,6 +148,7 @@ def select_snapshots(text: str) -> Selection:
     ]
     return Selection(
         snapshots=snapshots,
+        latest_types=latest_types,
         rejected_lines=rejected,
         rejected_entries=rejected_entries,
         ignored_lines=ignored,
@@ -170,7 +176,14 @@ def build_records(
             "retro_uuid": retro_uuid,
             "record_id": RECORD_ID_PREFIX + retro_uuid,
         }
-        if snapshot.get("archived_at") is not None:
+        archived = snapshot.get("archived_at") is not None
+        event_type = selection.latest_types[retro_uuid]
+        if (event_type == "retro_entry_archived" and not archived) or (
+            event_type == "retro_entry_unarchived" and archived
+        ):
+            rejected.append({**identity, "reason": "invalid_snapshot"})
+            continue
+        if archived:
             skipped.append({**identity, "reason": "archived"})
             continue
         project = snapshot.get("project")
@@ -236,12 +249,22 @@ def run(text: str, timezone_name: str) -> tuple[list[dict], dict]:
     return records, report
 
 
-def refuse_public_output(output: Path) -> None:
-    """Adapters write only to private instance paths (AGENTS.md, docs/instance.md)."""
+def refuse_public_output(output: Path, export: Path) -> None:
+    """Adapters write only to private instance paths (AGENTS.md, docs/instance.md).
+
+    The deny set is every public engine checkout the AGENTS.md map names:
+    this repository plus its documented siblings. The export itself is also
+    refused as a destination so a typo cannot truncate the source.
+    """
     resolved = output.resolve()
+    if resolved == export.resolve():
+        raise AdapterError(
+            f"output path {output} is the export itself; refusing to "
+            "overwrite the source"
+        )
     root = Path(__file__).resolve().parents[1]
     roots = [root]
-    for name in ("ephemeris", "atlas", "exp2res"):
+    for name in PUBLIC_SIBLINGS:
         sibling = root.parent / name
         if sibling.is_dir():
             roots.append(sibling.resolve())
@@ -275,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        refuse_public_output(Path(args.output))
+        refuse_public_output(Path(args.output), Path(args.export_path))
     except AdapterError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

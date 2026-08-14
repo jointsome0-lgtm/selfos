@@ -24,9 +24,10 @@ text.
 
 The output file is the delivery payload and the only content copy the
 adapter produces (deletion-contract rule, #25). Both ends of the handoff
-are explicit: the adapter refuses an `-o` path that resolves inside a
-public engine checkout (adapters operate only on private instance paths,
-[instance.md](instance.md)), and once the import report is confirmed the
+are explicit: the adapter refuses an `-o` path that resolves inside any
+public engine checkout the AGENTS.md map names (adapters operate only on
+private instance paths, [instance.md](instance.md)) or onto the export
+itself, and once the import report is confirmed the
 owner deletes the payload file — it is a transient handoff artifact, not
 a second store, and nothing else retains shipped entry text outside the
 receiving workspace.
@@ -97,7 +98,7 @@ never per edit.
 | skipped | `archived` | latest snapshot is archived |
 | skipped | `no_project` | §19.1 requires a project label |
 | rejected | `period_unparsable:<code>` | exp2res grammar refused `period_raw` (grammar drift) |
-| rejected | `invalid_snapshot` | snapshot field types are not the sec33 wire shape |
+| rejected | `invalid_snapshot` | snapshot field types are not the sec33 wire shape, or the latest event's archive transition contradicts its own snapshot (`retro_entry_archived` without `archived_at`, `retro_entry_unarchived` with it) |
 | rejected | `unsupported_payload_version` | some event of this identity carries an unknown `payload_version`; the whole entry is rejected (per line only when the line names no identity) |
 | rejected | `payload_not_object`, `missing_retro_uuid`, `line_not_json`, `line_not_event` | malformed export line (reported with its physical line number) |
 

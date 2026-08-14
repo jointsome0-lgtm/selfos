@@ -160,6 +160,22 @@ def test_cli_refuses_output_inside_a_public_checkout(tmp_path, capsys):
     assert "public checkout" in capsys.readouterr().err
 
 
+def test_cli_refuses_overwriting_the_export(tmp_path, capsys):
+    export = tmp_path / "events-export.jsonl"
+    export.write_text(
+        export_line("retro_entry_created", snapshot("uuid-a")) + "\n",
+        encoding="utf-8",
+    )
+    alias = tmp_path / "alias.jsonl"
+    alias.symlink_to(export)
+    exit_code = retro_adapter.main(
+        [str(export), "--timezone", "Europe/Berlin", "-o", str(alias)]
+    )
+    assert exit_code == 2
+    assert "refusing to overwrite the source" in capsys.readouterr().err
+    assert "retro_entry_created" in export.read_text(encoding="utf-8")
+
+
 def test_cli_refuses_an_undecodable_export(tmp_path, capsys):
     export = tmp_path / "events-export.jsonl"
     export.write_bytes(b'{"type": "retro_entry_created"\xff\xfe}\n')
