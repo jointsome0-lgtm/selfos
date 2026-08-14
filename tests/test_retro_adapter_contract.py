@@ -291,6 +291,31 @@ def test_cli_accepts_output_inside_the_configured_private_root(
     assert json.loads(capsys.readouterr().out)["counts"]["accepted"] == 1
 
 
+def test_cli_accepts_output_inside_the_instance_flag_root(tmp_path, capsys):
+    export = tmp_path / "events-export.jsonl"
+    export.write_text(
+        export_line("retro_entry_created", snapshot("uuid-a")) + "\n",
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "vera-workspace"
+    workspace.mkdir()
+    output = workspace / "retro-191.jsonl"
+    exit_code = retro_adapter.main(
+        [
+            str(export),
+            "--timezone",
+            TIMEZONE,
+            "-o",
+            str(output),
+            "--instance",
+            str(workspace),
+        ]
+    )
+    assert exit_code == 0
+    assert output.exists()
+    assert json.loads(capsys.readouterr().out)["counts"]["accepted"] == 1
+
+
 def test_cli_writes_payload_and_prints_report(tmp_path, capsys):
     export = tmp_path / "events-export.jsonl"
     export.write_text(

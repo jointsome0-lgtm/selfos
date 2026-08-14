@@ -24,20 +24,23 @@ text.
 
 The output file is the delivery payload and the only content copy the
 adapter produces (deletion-contract rule, #25). Both ends of the handoff
-are explicit. When an exp2res private root is configured
-(`EXP2RES_WORKSPACE`, then `instances.exp2res` in
-`~/.config/selfos/config.toml` — the [instance.md](instance.md)
-discovery order), the `-o` path must resolve inside that root: adapters
-operate only on explicitly configured private-instance paths. With no
-root configured the run is refused outright — the adapter cannot tell
-personal data from fixtures — unless `--allow-unconfigured` explicitly
-marks it an invented-data run to a private destination; even then an
-`-o` path inside any public engine checkout the AGENTS.md map names is
-refused, as is output onto the export itself (symlink and hard-link
-aliases included). The export is likewise refused as a source when it
-resolves inside a public checkout; it is not required to sit inside an
-ephemeris root, because ephemeris delivers exports as browser
-downloads. The payload is written with owner-only permissions (`0600`).
+are explicit. When an exp2res private root is configured (the explicit
+`--instance PATH` flag, then `EXP2RES_WORKSPACE`, then
+`instances.exp2res` in `~/.config/selfos/config.toml` — the
+[instance.md](instance.md) discovery order), the `-o` path must resolve
+inside that root: adapters operate only on explicitly configured
+private-instance paths, and a configured root that itself lies inside a
+public checkout is refused — the explicit flag does not bypass that
+guard. With no root configured the run is refused outright — the
+adapter cannot tell personal data from fixtures — unless
+`--allow-unconfigured` explicitly marks it an invented-data run to a
+private destination; even then an `-o` path inside any public engine
+checkout the AGENTS.md map names is refused (checked as both the
+pathname given and its symlink-resolved target), as is output onto the
+export itself (symlink and hard-link aliases included). The export is
+likewise refused as a source when it lies inside a public checkout; it
+is not required to sit inside an ephemeris root, because ephemeris
+delivers exports as browser downloads. The payload is written with owner-only permissions (`0600`).
 Once the import report is confirmed the owner deletes
 the payload file — it is a transient handoff artifact, not a second
 store, and nothing else retains shipped entry text outside the
@@ -120,12 +123,13 @@ never per edit.
 | rejected | `invalid_snapshot` | snapshot field types are not the sec33 wire shape (a non-string `project` included), or the latest event's archive transition contradicts its own snapshot (`retro_entry_archived` without `archived_at`, `retro_entry_unarchived` with it) |
 | rejected | `text_not_encodable` | the record cannot be encoded as UTF-8 (e.g. an unpaired surrogate in a corrupted export) |
 | rejected | `unsupported_payload_version` | some event of this identity carries a `payload_version` that is not exactly the integer `1`; the whole entry is rejected |
-| rejected | `line_not_json`, `line_not_event` | malformed export line (reported with its physical line number) |
 
-A retro event whose payload carries no attributable `retro_uuid`
-refuses the whole run: with no identity to pin the damage to, an
-unattributable lifecycle event could hide an edit or archive of any
-entry.
+Two corruptions refuse the whole run rather than a single record, each
+named with its physical line number: a retro event whose payload
+carries no attributable `retro_uuid`, and any line that is not a JSON
+event object at all. Both share one reason — with no identity to pin
+the damage to, the unreadable line could hide an edit or archive of any
+entry, and an earlier snapshot must never stand in for it.
 
 Deterministic only: no model call, no network, no persistent state, and
 entry text cannot alter behaviour. Requires the `exp2res` package to be

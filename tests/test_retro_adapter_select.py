@@ -60,7 +60,7 @@ def test_latest_event_per_uuid_wins_in_first_seen_order():
     selection = retro_adapter.select_snapshots(text)
     assert list(selection.snapshots) == ["uuid-a", "uuid-b"]
     assert selection.snapshots["uuid-a"]["text"] == "Vera Example final phrasing."
-    assert selection.rejected_lines == []
+    assert selection.rejected_entries == []
     assert selection.ignored_lines == 0
 
 
@@ -75,31 +75,27 @@ def test_non_retro_event_types_are_ignored_not_reported():
     selection = retro_adapter.select_snapshots(text)
     assert list(selection.snapshots) == ["uuid-a"]
     assert selection.ignored_lines == 2
-    assert selection.rejected_lines == []
+    assert selection.rejected_entries == []
 
 
-def test_malformed_lines_are_rejected_with_physical_line_numbers():
-    text = "\n".join(
-        [
-            export_line("retro_entry_created", snapshot("uuid-a")),
-            "",
-            "{not json",
-            json.dumps(["not", "an", "event"]),
-        ]
-    )
-    selection = retro_adapter.select_snapshots(text)
-    assert list(selection.snapshots) == ["uuid-a"]
-    assert selection.rejected_lines == [
-        {"line": 3, "reason": "line_not_json"},
-        {"line": 4, "reason": "line_not_event"},
-    ]
+def test_malformed_lines_refuse_the_whole_run_with_the_physical_line():
+    for bad_line in ("{not json", json.dumps(["not", "an", "event"])):
+        text = "\n".join(
+            [
+                export_line("retro_entry_created", snapshot("uuid-a")),
+                "",
+                bad_line,
+            ]
+        )
+        with pytest.raises(retro_adapter.AdapterError) as excinfo:
+            retro_adapter.select_snapshots(text)
+        assert "line 3" in str(excinfo.value)
 
 
 def test_unsupported_payload_version_rejects_the_whole_identity():
     text = export_line("retro_entry_created", snapshot("uuid-a"), version=2)
     selection = retro_adapter.select_snapshots(text)
     assert selection.snapshots == {}
-    assert selection.rejected_lines == []
     assert selection.rejected_entries == [
         {
             "retro_uuid": "uuid-a",
@@ -300,5 +296,90 @@ def test_cli_refuses_an_unconfigured_run_without_the_optin_flag(
         [str(export), "--timezone", "Europe/Berlin", "-o", str(output)]
     )
     assert exit_code == 2
-    assert "EXP2RES_WORKSPACE" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "--instance" in err
+    assert "EXP2RES_WORKSPACE" in err
     assert not output.exists()
+
+
+def test_cli_refuses_an_output_alias_through_a_public_checkout(
+    tmp_path, capsys, monkeypatch
+):
+    export = tmp_path / "events-export.jsonl"
+    export.write_text(
+        export_line("retro_entry_created", snapshot("uuid-a")) + "\n",
+        encoding="utf-8",
+    )
+    private_dir = tmp_path / "vera-private"
+    private_dir.mkdir()
+    public_root = Path(retro_adapter.__file__).resolve().parents[1]
+    alias = public_root / "vera-private-link"
+    alias.symlink_to(private_dir)
+    try:
+        monkeypatch.setenv("EXP2RES_WORKSPACE", str(alias))
+        exit_code = retro_adapter.main(
+            [
+                str(export),
+                "--timezone",
+                "Europe/Berlin",
+                "-o",
+                str(alias / "vera-out.jsonl"),
+            ]
+        )
+    finally:
+        alias.unlink()
+    assert exit_code == 2
+    assert "public checkout" in capsys.readouterr().err
+    assert not (private_dir / "vera-out.jsonl").exists()
+
+
+def test_instance_flag_outranks_the_environment_root(
+    tmp_path, capsys, monkeypatch
+):
+    export = tmp_path / "events-export.jsonl"
+    export.write_text(
+        export_line("retro_entry_created", snapshot("uuid-a")) + "\n",
+        encoding="utf-8",
+    )
+    flag_root = tmp_path / "vera-flag-root"
+    flag_root.mkdir()
+    env_root = tmp_path / "vera-env-root"
+    env_root.mkdir()
+    monkeypatch.setenv("EXP2RES_WORKSPACE", str(env_root))
+    output = env_root / "vera-out.jsonl"
+    exit_code = retro_adapter.main(
+        [
+            str(export),
+            "--timezone",
+            "Europe/Berlin",
+            "-o",
+            str(output),
+            "--instance",
+            str(flag_root),
+        ]
+    )
+    assert exit_code == 2
+    assert "configured exp2res private root" in capsys.readouterr().err
+    assert not output.exists()
+
+
+def test_instance_flag_does_not_bypass_the_public_guard(tmp_path, capsys):
+    export = tmp_path / "events-export.jsonl"
+    export.write_text(
+        export_line("retro_entry_created", snapshot("uuid-a")) + "\n",
+        encoding="utf-8",
+    )
+    public_root = Path(retro_adapter.__file__).resolve().parents[1]
+    exit_code = retro_adapter.main(
+        [
+            str(export),
+            "--timezone",
+            "Europe/Berlin",
+            "-o",
+            str(tmp_path / "vera-out.jsonl"),
+            "--instance",
+            str(public_root),
+        ]
+    )
+    assert exit_code == 2
+    assert "public checkout" in capsys.readouterr().err

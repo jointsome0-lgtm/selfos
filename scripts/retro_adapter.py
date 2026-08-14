@@ -77,7 +77,6 @@ class Selection:
 
     snapshots: dict[str, dict]
     latest_types: dict[str, str]
-    rejected_lines: list[dict]
     rejected_entries: list[dict]
     ignored_lines: int
 
@@ -99,14 +98,15 @@ def select_snapshots(text: str) -> Selection:
     is rejected whole: its latest state is unreadable, so no earlier
     snapshot may stand in for it. A retro event with no attributable
     ``retro_uuid`` refuses the whole run for the same reason, with no
-    identity to pin the damage to. Line numbers are physical (blank lines
-    count, matching a text editor); non-retro event types are counted,
-    never reported per line.
+    identity to pin the damage to — and so does any line that is not a
+    JSON event object at all, because a corrupted line cannot be proven
+    non-retro and could hide an edit or archive. Line numbers are physical
+    (blank lines count, matching a text editor); non-retro event types are
+    counted, never reported per line.
     """
     snapshots: dict[str, dict] = {}
     latest_types: dict[str, str] = {}
     poisoned: dict[str, None] = {}
-    rejected: list[dict] = []
     ignored = 0
     for number, line in enumerate(text.split("\n"), 1):
         if not line.strip():
@@ -114,11 +114,17 @@ def select_snapshots(text: str) -> Selection:
         try:
             event = json.loads(line)
         except ValueError:
-            rejected.append({"line": number, "reason": "line_not_json"})
-            continue
+            raise AdapterError(
+                f"line {number} is not JSON; refusing the whole export, "
+                "because a corrupted line cannot be proven non-retro and "
+                "could hide an edit or archive of some entry"
+            ) from None
         if not isinstance(event, dict) or not isinstance(event.get("type"), str):
-            rejected.append({"line": number, "reason": "line_not_event"})
-            continue
+            raise AdapterError(
+                f"line {number} is not an event object; refusing the whole "
+                "export, because an unreadable line cannot be proven "
+                "non-retro and could hide an edit or archive of some entry"
+            )
         if event["type"] not in RETRO_EVENT_TYPES:
             ignored += 1
             continue
@@ -155,7 +161,6 @@ def select_snapshots(text: str) -> Selection:
     return Selection(
         snapshots=snapshots,
         latest_types=latest_types,
-        rejected_lines=rejected,
         rejected_entries=rejected_entries,
         ignored_lines=ignored,
     )
@@ -251,7 +256,7 @@ def run(text: str, timezone_name: str) -> tuple[list[dict], dict]:
     records, accepted, skipped, entry_rejected = build_records(
         selection, timezone_name
     )
-    rejected = selection.rejected_lines + selection.rejected_entries + entry_rejected
+    rejected = selection.rejected_entries + entry_rejected
     report = {
         "counts": {
             "accepted": len(accepted),
@@ -266,13 +271,16 @@ def run(text: str, timezone_name: str) -> tuple[list[dict], dict]:
     return records, report
 
 
-def configured_private_root() -> Path | None:
+def configured_private_root(explicit: str | None = None) -> Path | None:
     """The exp2res private root, by the docs/instance.md discovery order.
 
-    ``EXP2RES_WORKSPACE`` first, then ``instances.exp2res`` in the user
-    config. A config that exists but cannot be read or parsed refuses the
-    run rather than silently weakening the output boundary.
+    The explicit ``--instance`` flag first, then ``EXP2RES_WORKSPACE``,
+    then ``instances.exp2res`` in the user config. A config that exists
+    but cannot be read or parsed refuses the run rather than silently
+    weakening the output boundary.
     """
+    if explicit:
+        return Path(explicit)
     value = os.environ.get(ENV_VAR)
     if value:
         return Path(value)
@@ -312,28 +320,40 @@ def _public_roots() -> list[Path]:
 
 
 def _refuse_inside_public(path: Path, resolved: Path, role: str) -> None:
+    # Both representations are checked: the symlink-resolved target and
+    # the pathname as given, so a payload is never reachable through a
+    # name inside a public checkout even when its target is private.
+    lexical = Path(os.path.abspath(path))
     for public_root in _public_roots():
-        if resolved.is_relative_to(public_root):
-            raise AdapterError(
-                f"{role} path {path} resolves inside the public checkout "
-                f"{public_root}; a public checkout is never a data source "
-                "or destination (docs/instance.md)"
-            )
+        for candidate in (lexical, resolved):
+            if candidate.is_relative_to(public_root):
+                raise AdapterError(
+                    f"{role} path {path} lies inside the public checkout "
+                    f"{public_root}; a public checkout is never a data "
+                    "source or destination (docs/instance.md)"
+                )
 
 
 def refuse_unsafe_paths(
-    output: Path, export: Path, *, allow_unconfigured: bool = False
+    output: Path,
+    export: Path,
+    *,
+    instance: str | None = None,
+    allow_unconfigured: bool = False,
 ) -> None:
     """Adapters operate only on private instance paths (AGENTS.md, docs/instance.md).
 
-    Neither the export nor the output may resolve inside a public engine
+    Neither the export nor the output may lie inside a public engine
     checkout the AGENTS.md map names. When an exp2res private root is
-    configured (``EXP2RES_WORKSPACE`` or ``instances.exp2res`` in the user
-    config), the output must additionally resolve inside it; with no root
-    configured the run is refused unless ``allow_unconfigured`` explicitly
-    marks it an invented-data run to a private destination. The export is
-    never required to sit inside an ephemeris root: ephemeris delivers
-    exports as browser downloads. The export is also refused as the output
+    configured (``--instance``, then ``EXP2RES_WORKSPACE``, then
+    ``instances.exp2res`` in the user config), the output must
+    additionally resolve inside it, and the root itself is refused when
+    it lies inside a public checkout — an explicit flag does not bypass
+    that guard (docs/instance.md). With no root configured the run is
+    refused unless ``allow_unconfigured`` explicitly marks it an
+    invented-data run to a private destination. The export is never
+    required to sit inside an ephemeris root: ephemeris delivers exports
+    as browser downloads. The export is also refused as the output
     destination, through symlink and hard-link aliases alike, so a typo
     cannot truncate the source.
     """
@@ -348,22 +368,27 @@ def refuse_unsafe_paths(
             "overwrite the source"
         )
     _refuse_inside_public(export, resolved_export, "export")
-    private_root = configured_private_root()
+    private_root = configured_private_root(instance)
     if private_root is None:
         if not allow_unconfigured:
             raise AdapterError(
-                "no exp2res private root is configured (EXP2RES_WORKSPACE "
-                "or instances.exp2res in the user config) and the adapter "
-                "cannot tell personal data from fixtures; configure the "
-                "root, or pass --allow-unconfigured only for an "
-                "invented-data run to a private destination"
+                "no private instance configured: pass --instance PATH, "
+                "set EXP2RES_WORKSPACE, or set instances.exp2res in "
+                "~/.config/selfos/config.toml; a public checkout is never "
+                "a data destination (selfos docs/instance.md) — or pass "
+                "--allow-unconfigured only for an invented-data run to a "
+                "private destination"
             )
-    elif not resolved_output.is_relative_to(private_root.resolve()):
-        raise AdapterError(
-            f"output path {output} is outside the configured exp2res "
-            f"private root {private_root}; write the payload there "
-            "(docs/instance.md)"
+    else:
+        _refuse_inside_public(
+            private_root, private_root.resolve(), "configured private root"
         )
+        if not resolved_output.is_relative_to(private_root.resolve()):
+            raise AdapterError(
+                f"output path {output} is outside the configured exp2res "
+                f"private root {private_root}; write the payload there "
+                "(docs/instance.md)"
+            )
     _refuse_inside_public(output, resolved_output, "output")
 
 
@@ -387,6 +412,14 @@ def main(argv: list[str] | None = None) -> int:
         help="destination for the §19.1 JSONL payload",
     )
     parser.add_argument(
+        "--instance",
+        help=(
+            "exp2res private root for this run; highest-precedence "
+            "discovery source (docs/instance.md), before "
+            "EXP2RES_WORKSPACE and the user config"
+        ),
+    )
+    parser.add_argument(
         "--allow-unconfigured",
         action="store_true",
         help=(
@@ -399,6 +432,7 @@ def main(argv: list[str] | None = None) -> int:
         refuse_unsafe_paths(
             Path(args.output),
             Path(args.export_path),
+            instance=args.instance,
             allow_unconfigured=args.allow_unconfigured,
         )
     except AdapterError as exc:
