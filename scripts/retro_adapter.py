@@ -18,7 +18,9 @@ grammar refuses rejects that record with a reason — never an approximation.
 
 The run report (stdout, one JSON object) carries counts and per-record
 reason codes only, never entry text. The output file is the delivery
-payload and the only copy the adapter produces.
+payload and the only copy the adapter produces: it must live on a private
+instance path (an output inside a public engine checkout is refused), and
+the owner deletes it once the import report is confirmed.
 
 Requires the ``exp2res`` package to be importable (installed, or its
 checkout on ``PYTHONPATH``). Contracts: exp2res ``spec/19-integration-
@@ -69,16 +71,31 @@ class Selection:
 
     snapshots: dict[str, dict]
     rejected_lines: list[dict]
+    rejected_entries: list[dict]
     ignored_lines: int
+
+
+def _payload_uuid(event: dict) -> str | None:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    retro_uuid = payload.get("retro_uuid")
+    if not isinstance(retro_uuid, str) or not retro_uuid:
+        return None
+    return retro_uuid
 
 
 def select_snapshots(text: str) -> Selection:
     """Group ``retro_entry_*`` lines by ``retro_uuid``; latest line wins.
 
-    Line numbers are physical (blank lines count, matching a text editor);
-    non-retro event types are counted, never reported per line.
+    An identity that carries any event with an unsupported payload version
+    is rejected whole: its latest state is unreadable, so no earlier
+    snapshot may stand in for it. Line numbers are physical (blank lines
+    count, matching a text editor); non-retro event types are counted,
+    never reported per line.
     """
     snapshots: dict[str, dict] = {}
+    poisoned: dict[str, None] = {}
     rejected: list[dict] = []
     ignored = 0
     for number, line in enumerate(text.split("\n"), 1):
@@ -96,9 +113,14 @@ def select_snapshots(text: str) -> Selection:
             ignored += 1
             continue
         if event.get("payload_version") != SUPPORTED_PAYLOAD_VERSION:
-            rejected.append(
-                {"line": number, "reason": "unsupported_payload_version"}
-            )
+            retro_uuid = _payload_uuid(event)
+            if retro_uuid is None:
+                rejected.append(
+                    {"line": number, "reason": "unsupported_payload_version"}
+                )
+            else:
+                poisoned.setdefault(retro_uuid)
+                snapshots.pop(retro_uuid, None)
             continue
         payload = event.get("payload")
         if not isinstance(payload, dict):
@@ -108,8 +130,23 @@ def select_snapshots(text: str) -> Selection:
         if not isinstance(retro_uuid, str) or not retro_uuid:
             rejected.append({"line": number, "reason": "missing_retro_uuid"})
             continue
+        if retro_uuid in poisoned:
+            continue
         snapshots[retro_uuid] = payload
-    return Selection(snapshots=snapshots, rejected_lines=rejected, ignored_lines=ignored)
+    rejected_entries = [
+        {
+            "retro_uuid": retro_uuid,
+            "record_id": RECORD_ID_PREFIX + retro_uuid,
+            "reason": "unsupported_payload_version",
+        }
+        for retro_uuid in poisoned
+    ]
+    return Selection(
+        snapshots=snapshots,
+        rejected_lines=rejected,
+        rejected_entries=rejected_entries,
+        ignored_lines=ignored,
+    )
 
 
 def build_records(
@@ -184,7 +221,7 @@ def run(text: str, timezone_name: str) -> tuple[list[dict], dict]:
     records, accepted, skipped, entry_rejected = build_records(
         selection, timezone_name
     )
-    rejected = selection.rejected_lines + entry_rejected
+    rejected = selection.rejected_lines + selection.rejected_entries + entry_rejected
     report = {
         "counts": {
             "accepted": len(accepted),
@@ -197,6 +234,24 @@ def run(text: str, timezone_name: str) -> tuple[list[dict], dict]:
         "rejected": rejected,
     }
     return records, report
+
+
+def refuse_public_output(output: Path) -> None:
+    """Adapters write only to private instance paths (AGENTS.md, docs/instance.md)."""
+    resolved = output.resolve()
+    root = Path(__file__).resolve().parents[1]
+    roots = [root]
+    for name in ("ephemeris", "atlas", "exp2res"):
+        sibling = root.parent / name
+        if sibling.is_dir():
+            roots.append(sibling.resolve())
+    for public_root in roots:
+        if resolved.is_relative_to(public_root):
+            raise AdapterError(
+                f"output path {output} resolves inside the public checkout "
+                f"{public_root}; write the payload to a private instance "
+                "path (docs/instance.md)"
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -220,8 +275,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
+        refuse_public_output(Path(args.output))
+    except AdapterError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
         text = Path(args.export_path).read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         print(f"error: cannot read export: {exc}", file=sys.stderr)
         return 2
     try:

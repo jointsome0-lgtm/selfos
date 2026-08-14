@@ -1,13 +1,15 @@
-"""Retro-slice selection tests for scripts/retro_adapter.py (issue #37).
+"""Retro-slice selection and CLI-boundary tests for scripts/retro_adapter.py.
 
-Selection is pure line handling and needs no exp2res; the temporal grammar
-and §19.1 shape are covered in test_retro_adapter_contract.py. All data is
-invented for the Vera Example persona.
+Everything here runs without exp2res (issue #37): selection is pure line
+handling, and the CLI refusals fire before the temporal grammar loads. The
+grammar and §19.1 shape are covered in test_retro_adapter_contract.py. All
+data is invented for the Vera Example persona.
 """
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from scripts import retro_adapter
 
@@ -90,13 +92,88 @@ def test_malformed_lines_are_rejected_with_physical_line_numbers():
     ]
 
 
-def test_unsupported_payload_version_is_rejected():
+def test_unsupported_payload_version_rejects_the_whole_identity():
     text = export_line("retro_entry_created", snapshot("uuid-a"), version=2)
     selection = retro_adapter.select_snapshots(text)
     assert selection.snapshots == {}
+    assert selection.rejected_lines == []
+    assert selection.rejected_entries == [
+        {
+            "retro_uuid": "uuid-a",
+            "record_id": "ephemeris:retro:uuid-a",
+            "reason": "unsupported_payload_version",
+        }
+    ]
+
+
+def test_unsupported_later_event_never_falls_back_to_a_stale_snapshot():
+    text = "\n".join(
+        [
+            export_line("retro_entry_created", snapshot("uuid-a")),
+            export_line(
+                "retro_entry_archived",
+                snapshot("uuid-a", archived_at="2026-05-03T09:00:00+02:00"),
+                version=2,
+            ),
+            export_line("retro_entry_created", snapshot("uuid-b")),
+        ]
+    )
+    selection = retro_adapter.select_snapshots(text)
+    assert list(selection.snapshots) == ["uuid-b"]
+    assert [entry["retro_uuid"] for entry in selection.rejected_entries] == ["uuid-a"]
+
+
+def test_poisoned_identity_stays_rejected_after_a_later_valid_event():
+    text = "\n".join(
+        [
+            export_line("retro_entry_created", snapshot("uuid-a"), version=2),
+            export_line("retro_entry_updated", snapshot("uuid-a")),
+        ]
+    )
+    selection = retro_adapter.select_snapshots(text)
+    assert selection.snapshots == {}
+    assert [entry["retro_uuid"] for entry in selection.rejected_entries] == ["uuid-a"]
+
+
+def test_unsupported_version_without_identity_is_rejected_per_line():
+    text = export_line("retro_entry_created", {"note": "no uuid"}, version=2)
+    selection = retro_adapter.select_snapshots(text)
     assert selection.rejected_lines == [
         {"line": 1, "reason": "unsupported_payload_version"}
     ]
+    assert selection.rejected_entries == []
+
+
+def test_cli_refuses_output_inside_a_public_checkout(tmp_path, capsys):
+    export = tmp_path / "events-export.jsonl"
+    export.write_text(
+        export_line("retro_entry_created", snapshot("uuid-a")) + "\n",
+        encoding="utf-8",
+    )
+    public_root = Path(retro_adapter.__file__).resolve().parents[1]
+    output = public_root / "vera-payload.jsonl"
+    exit_code = retro_adapter.main(
+        [str(export), "--timezone", "Europe/Berlin", "-o", str(output)]
+    )
+    assert exit_code == 2
+    assert not output.exists()
+    assert "public checkout" in capsys.readouterr().err
+
+
+def test_cli_refuses_an_undecodable_export(tmp_path, capsys):
+    export = tmp_path / "events-export.jsonl"
+    export.write_bytes(b'{"type": "retro_entry_created"\xff\xfe}\n')
+    exit_code = retro_adapter.main(
+        [
+            str(export),
+            "--timezone",
+            "Europe/Berlin",
+            "-o",
+            str(tmp_path / "vera-out.jsonl"),
+        ]
+    )
+    assert exit_code == 2
+    assert "cannot read export" in capsys.readouterr().err
 
 
 def test_retro_event_without_retro_uuid_is_rejected():

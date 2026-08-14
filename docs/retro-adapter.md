@@ -20,16 +20,26 @@ zone: ephemeris ships the owner-typed period verbatim and exp2res
 re-resolves it in workspace time (retro-spec sec2), so the zone is an
 explicit argument, never guessed. The run report (stdout, one JSON
 object) carries counts and per-record reason codes only — never entry
-text. The output file is the delivery payload and the only content copy
-the adapter produces (deletion-contract rule, #25).
+text.
+
+The output file is the delivery payload and the only content copy the
+adapter produces (deletion-contract rule, #25). Both ends of the handoff
+are explicit: the adapter refuses an `-o` path that resolves inside a
+public engine checkout (adapters operate only on private instance paths,
+[instance.md](instance.md)), and once the import report is confirmed the
+owner deletes the payload file — it is a transient handoff artifact, not
+a second store, and nothing else retains shipped entry text outside the
+receiving workspace.
 
 ## Selection
 
 Export lines are grouped by `payload.retro_uuid`; the latest
 `retro_entry_*` event in file order wins (the export is ordered by ledger
 append order); an entry whose latest snapshot has `archived_at` set is
-excluded (`skipped: archived`). Any other event type is ignored and
-counted — this event-type filter is the seam where diary events
+excluded (`skipped: archived`). An identity carrying any event with an
+unsupported `payload_version` is rejected whole — its latest state is
+unreadable, so an older snapshot never stands in for it. Any other event
+type is ignored and counted — this event-type filter is the seam where diary events
 (ephemeris#2) would be admitted later, and nothing else is built for
 them. A knowledge-state payload is never this slice: it is not a
 `retro_entry_*` event, so it never passes the filter, and no
@@ -88,7 +98,8 @@ never per edit.
 | skipped | `no_project` | §19.1 requires a project label |
 | rejected | `period_unparsable:<code>` | exp2res grammar refused `period_raw` (grammar drift) |
 | rejected | `invalid_snapshot` | snapshot field types are not the sec33 wire shape |
-| rejected | `unsupported_payload_version`, `payload_not_object`, `missing_retro_uuid`, `line_not_json`, `line_not_event` | malformed export line (reported with its physical line number) |
+| rejected | `unsupported_payload_version` | some event of this identity carries an unknown `payload_version`; the whole entry is rejected (per line only when the line names no identity) |
+| rejected | `payload_not_object`, `missing_retro_uuid`, `line_not_json`, `line_not_event` | malformed export line (reported with its physical line number) |
 
 Deterministic only: no model call, no network, no persistent state, and
 entry text cannot alter behaviour. Requires the `exp2res` package to be
