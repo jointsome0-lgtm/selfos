@@ -100,8 +100,10 @@ def select_snapshots(text: str) -> Selection:
     ``retro_uuid`` refuses the whole run for the same reason, with no
     identity to pin the damage to — and so does any line that is not a
     JSON event object at all, because a corrupted line cannot be proven
-    non-retro and could hide an edit or archive. Line numbers are physical
-    (blank lines count, matching a text editor); non-retro event types are
+    non-retro and could hide an edit or archive, and any unknown
+    ``retro_entry_*`` type, because a newer lifecycle event could change
+    the selected state of any entry. Line numbers are physical (blank
+    lines count, matching a text editor); non-retro event types are
     counted, never reported per line.
     """
     snapshots: dict[str, dict] = {}
@@ -126,6 +128,14 @@ def select_snapshots(text: str) -> Selection:
                 "non-retro and could hide an edit or archive of some entry"
             )
         if event["type"] not in RETRO_EVENT_TYPES:
+            if event["type"].startswith("retro_entry_"):
+                raise AdapterError(
+                    f"line {number}: unknown retro lifecycle event type "
+                    f"{event['type']!r}; the export speaks a newer retro "
+                    "contract than this adapter supports, and an unknown "
+                    "lifecycle event could change the selected state of "
+                    "any entry"
+                )
             ignored += 1
             continue
         retro_uuid = _payload_uuid(event)
@@ -449,18 +459,29 @@ def main(argv: list[str] | None = None) -> int:
     except AdapterError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    # The payload lands in a fresh owner-only file that atomically
+    # replaces the destination name: truncating an existing destination
+    # in place would follow a hard-linked alias's shared inode, and an
+    # alias never receives the payload.
+    staging = args.output + ".tmp"
     try:
         body = "".join(
             json.dumps(r, ensure_ascii=False) + "\n" for r in records
         ).encode("utf-8")
         fd = os.open(
-            args.output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+            staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
         )
-        with os.fdopen(fd, "wb") as handle:
-            # An existing destination keeps its old mode through os.open;
-            # restrict the descriptor before any payload byte is written.
-            os.fchmod(handle.fileno(), 0o600)
-            handle.write(body)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                handle.write(body)
+            os.replace(staging, args.output)
+        except BaseException:
+            try:
+                os.unlink(staging)
+            except OSError:
+                pass
+            raise
     except (OSError, UnicodeError) as exc:
         print(f"error: cannot write output: {exc}", file=sys.stderr)
         return 2

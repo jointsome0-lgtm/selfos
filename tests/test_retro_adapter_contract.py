@@ -9,6 +9,7 @@ is invented for the Vera Example persona.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -289,6 +290,36 @@ def test_cli_accepts_output_inside_the_configured_private_root(
     assert exit_code == 0
     assert output.exists()
     assert json.loads(capsys.readouterr().out)["counts"]["accepted"] == 1
+
+
+def test_payload_never_reaches_a_hard_linked_alias_of_the_destination(
+    tmp_path, capsys
+):
+    export = tmp_path / "events-export.jsonl"
+    export.write_text(
+        export_line("retro_entry_created", snapshot("uuid-a")) + "\n",
+        encoding="utf-8",
+    )
+    alias = tmp_path / "vera-alias.jsonl"
+    alias.write_text("untouched alias content\n", encoding="utf-8")
+    output = tmp_path / "retro-191.jsonl"
+    os.link(alias, output)
+    exit_code = retro_adapter.main(
+        [
+            str(export),
+            "--timezone",
+            TIMEZONE,
+            "-o",
+            str(output),
+            "--allow-unconfigured",
+        ]
+    )
+    assert exit_code == 0
+    assert alias.read_text(encoding="utf-8") == "untouched alias content\n"
+    assert output.stat().st_nlink == 1
+    assert output.stat().st_mode & 0o777 == 0o600
+    assert "ephemeris:retro:uuid-a" in output.read_text(encoding="utf-8")
+    assert not (tmp_path / "retro-191.jsonl.tmp").exists()
 
 
 def test_cli_accepts_output_inside_the_instance_flag_root(tmp_path, capsys):

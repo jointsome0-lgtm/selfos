@@ -149,6 +149,18 @@ def test_version_gate_requires_the_exact_integer_wire_type():
     ]
 
 
+def test_unknown_retro_lifecycle_type_refuses_the_whole_run():
+    text = "\n".join(
+        [
+            export_line("retro_entry_created", snapshot("uuid-a")),
+            export_line("retro_entry_deleted", snapshot("uuid-a")),
+        ]
+    )
+    with pytest.raises(retro_adapter.AdapterError) as excinfo:
+        retro_adapter.select_snapshots(text)
+    assert "retro_entry_deleted" in str(excinfo.value)
+
+
 def test_unattributable_retro_event_refuses_the_whole_run():
     for payload in ({"note": "no uuid"}, snapshot(""), "not an object"):
         text = "\n".join(

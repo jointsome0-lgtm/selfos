@@ -40,7 +40,10 @@ pathname given and its symlink-resolved target), as is output onto the
 export itself (symlink and hard-link aliases included). The export is
 likewise refused as a source when it lies inside a public checkout; it
 is not required to sit inside an ephemeris root, because ephemeris
-delivers exports as browser downloads. The payload is written with owner-only permissions (`0600`).
+delivers exports as browser downloads. The payload is written to a
+fresh owner-only (`0600`) staging file that atomically replaces the
+destination name — an existing destination's inode is never truncated
+in place, so a hard-linked alias of it never receives the payload.
 Once the import report is confirmed the owner deletes
 the payload file — it is a transient handoff artifact, not a second
 store, and nothing else retains shipped entry text outside the
@@ -124,11 +127,12 @@ never per edit.
 | rejected | `text_not_encodable` | the record cannot be encoded as UTF-8 (e.g. an unpaired surrogate in a corrupted export) |
 | rejected | `unsupported_payload_version` | some event of this identity carries a `payload_version` that is not exactly the integer `1`; the whole entry is rejected |
 
-Two corruptions refuse the whole run rather than a single record, each
+Three conditions refuse the whole run rather than a single record, each
 named with its physical line number: a retro event whose payload
-carries no attributable `retro_uuid`, and any line that is not a JSON
-event object at all. Both share one reason — with no identity to pin
-the damage to, the unreadable line could hide an edit or archive of any
+carries no attributable `retro_uuid`, any line that is not a JSON event
+object at all, and any unknown `retro_entry_*` event type (a newer
+retro contract than this adapter speaks). All share one reason — the
+unreadable or unrecognized event could change or hide the state of any
 entry, and an earlier snapshot must never stand in for it.
 
 Deterministic only: no model call, no network, no persistent state, and
