@@ -394,6 +394,78 @@ def test_instance_flag_outranks_the_environment_root(
     assert not output.exists()
 
 
+def test_a_file_valued_private_root_is_refused_before_overwrite(
+    tmp_path, capsys, monkeypatch
+):
+    export = tmp_path / "events-export.jsonl"
+    export.write_text(
+        export_line("retro_entry_created", snapshot("uuid-a")) + "\n",
+        encoding="utf-8",
+    )
+    root_file = tmp_path / "vera-root.jsonl"
+    root_file.write_text("precious owner content\n", encoding="utf-8")
+    monkeypatch.setenv("EXP2RES_WORKSPACE", str(root_file))
+    exit_code = retro_adapter.main(
+        [str(export), "--timezone", "Europe/Berlin", "-o", str(root_file)]
+    )
+    assert exit_code == 2
+    assert "existing directory" in capsys.readouterr().err
+    assert (
+        root_file.read_text(encoding="utf-8") == "precious owner content\n"
+    )
+
+
+def test_a_symlink_output_outside_the_root_is_refused(
+    tmp_path, capsys, monkeypatch
+):
+    export = tmp_path / "events-export.jsonl"
+    export.write_text(
+        export_line("retro_entry_created", snapshot("uuid-a")) + "\n",
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "vera-workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("EXP2RES_WORKSPACE", str(workspace))
+    target = workspace / "real.jsonl"
+    target.write_text("", encoding="utf-8")
+    link = tmp_path / "outside-link.jsonl"
+    link.symlink_to(target)
+    exit_code = retro_adapter.main(
+        [str(export), "--timezone", "Europe/Berlin", "-o", str(link)]
+    )
+    assert exit_code == 2
+    assert "strictly beneath" in capsys.readouterr().err
+    assert target.read_text(encoding="utf-8") == ""
+
+
+def test_a_leftover_staging_file_is_identified_and_refused(tmp_path, capsys):
+    export = tmp_path / "events-export.jsonl"
+    export.write_text(
+        export_line("retro_entry_created", snapshot("uuid-a")) + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "vera-out.jsonl"
+    stale = tmp_path / "vera-out.jsonl.tmp"
+    stale.write_text("stranded payload from a crash\n", encoding="utf-8")
+    exit_code = retro_adapter.main(
+        [
+            str(export),
+            "--timezone",
+            "Europe/Berlin",
+            "-o",
+            str(output),
+            "--allow-unconfigured",
+        ]
+    )
+    assert exit_code == 2
+    assert "interrupted run" in capsys.readouterr().err
+    assert (
+        stale.read_text(encoding="utf-8")
+        == "stranded payload from a crash\n"
+    )
+    assert not output.exists()
+
+
 def test_instance_flag_does_not_bypass_the_public_guard(tmp_path, capsys):
     export = tmp_path / "events-export.jsonl"
     export.write_text(

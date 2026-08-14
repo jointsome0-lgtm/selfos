@@ -27,11 +27,13 @@ adapter produces (deletion-contract rule, #25). Both ends of the handoff
 are explicit. When an exp2res private root is configured (the explicit
 `--instance PATH` flag, then `EXP2RES_WORKSPACE`, then
 `instances.exp2res` in `~/.config/selfos/config.toml` — the
-[instance.md](instance.md) discovery order), the `-o` path must resolve
-inside that root: adapters operate only on explicitly configured
-private-instance paths, and a configured root that itself lies inside a
-public checkout is refused — the explicit flag does not bypass that
-guard. With no root configured the run is refused outright — the
+[instance.md](instance.md) discovery order), the root must be an
+existing directory and the `-o` path must sit strictly beneath it — as
+both the written name and its resolved target, so neither a file-valued
+root nor a symlink parked outside the root can receive the payload:
+adapters operate only on explicitly configured private-instance paths,
+and a configured root that itself lies inside a public checkout is
+refused — the explicit flag does not bypass that guard. With no root configured the run is refused outright — the
 adapter cannot tell personal data from fixtures — unless
 `--allow-unconfigured` explicitly marks it an invented-data run to a
 private destination; even then an `-o` path inside any public engine
@@ -41,9 +43,13 @@ export itself (symlink and hard-link aliases included). The export is
 likewise refused as a source when it lies inside a public checkout; it
 is not required to sit inside an ephemeris root, because ephemeris
 delivers exports as browser downloads. The payload is written to a
-fresh owner-only (`0600`) staging file that atomically replaces the
-destination name — an existing destination's inode is never truncated
-in place, so a hard-linked alias of it never receives the payload.
+fresh owner-only (`0600`) staging file (`<output>.tmp`) that atomically
+replaces the destination name — an existing destination's inode is
+never truncated in place, so a hard-linked alias of it never receives
+the payload. A staging file left behind by an interrupted run is
+identified and refused at startup, never silently deleted or
+overwritten: it may hold a payload, so the owner inspects and deletes
+it before rerunning.
 Once the import report is confirmed the owner deletes
 the payload file — it is a transient handoff artifact, not a second
 store, and nothing else retains shipped entry text outside the

@@ -357,10 +357,14 @@ def refuse_unsafe_paths(
     Neither the export nor the output may lie inside a public engine
     checkout the AGENTS.md map names. When an exp2res private root is
     configured (``--instance``, then ``EXP2RES_WORKSPACE``, then
-    ``instances.exp2res`` in the user config), the output must
-    additionally resolve inside it, and the root itself is refused when
-    it lies inside a public checkout — an explicit flag does not bypass
-    that guard (docs/instance.md). With no root configured the run is
+    ``instances.exp2res`` in the user config), it must be an existing
+    directory and the output must sit strictly beneath it — as both the
+    written name and its resolved target, since the atomic replace lands
+    the payload at the name, not through a symlink. The root itself is
+    refused when it lies inside a public checkout — an explicit flag
+    does not bypass that guard (docs/instance.md). A leftover staging
+    file (``<output>.tmp``) from an interrupted run is identified and
+    refused, never silently deleted or overwritten. With no root configured the run is
     refused unless ``allow_unconfigured`` explicitly marks it an
     invented-data run to a private destination. The export is never
     required to sit inside an ephemeris root: ephemeris delivers exports
@@ -394,13 +398,37 @@ def refuse_unsafe_paths(
         _refuse_inside_public(
             private_root, private_root.resolve(), "configured private root"
         )
-        if not resolved_output.is_relative_to(private_root.resolve()):
+        resolved_root = private_root.resolve()
+        if not resolved_root.is_dir():
             raise AdapterError(
-                f"output path {output} is outside the configured exp2res "
-                f"private root {private_root}; write the payload there "
-                "(docs/instance.md)"
+                f"configured exp2res private root {private_root} is not an "
+                "existing directory; a root that names a file would itself "
+                "be overwritten by the payload (docs/instance.md)"
+            )
+        # The payload lands at the output *name* (atomic replace), so the
+        # name's own directory must sit inside the root too — a symlink
+        # outside the root pointing inside it would otherwise leave the
+        # payload at the symlink's location.
+        name_parent = Path(os.path.abspath(output)).parent.resolve()
+        if (
+            resolved_output == resolved_root
+            or not resolved_output.is_relative_to(resolved_root)
+            or not name_parent.is_relative_to(resolved_root)
+        ):
+            raise AdapterError(
+                f"output path {output} is not strictly beneath the "
+                f"configured exp2res private root {private_root}, as both "
+                "the written name and its resolved target must be; write "
+                "the payload there (docs/instance.md)"
             )
     _refuse_inside_public(output, resolved_output, "output")
+    staging = Path(str(output) + ".tmp")
+    if staging.exists() or staging.is_symlink():
+        raise AdapterError(
+            f"staging file {staging} already exists — likely a payload "
+            "left by an interrupted run; inspect and delete it before "
+            "rerunning"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
