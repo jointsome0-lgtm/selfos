@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts import retro_adapter
 
 
@@ -158,6 +160,41 @@ def test_cli_refuses_output_inside_a_public_checkout(tmp_path, capsys):
     assert exit_code == 2
     assert not output.exists()
     assert "public checkout" in capsys.readouterr().err
+
+
+def test_configured_private_root_becomes_the_only_allowed_destination(
+    tmp_path, capsys, monkeypatch
+):
+    export = tmp_path / "events-export.jsonl"
+    export.write_text(
+        export_line("retro_entry_created", snapshot("uuid-a")) + "\n",
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "vera-workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("EXP2RES_WORKSPACE", str(workspace))
+    outside = tmp_path / "elsewhere" / "vera-out.jsonl"
+    outside.parent.mkdir()
+    exit_code = retro_adapter.main(
+        [str(export), "--timezone", "Europe/Berlin", "-o", str(outside)]
+    )
+    assert exit_code == 2
+    assert "configured exp2res private root" in capsys.readouterr().err
+    assert not outside.exists()
+
+
+def test_config_file_root_is_honored(tmp_path, monkeypatch):
+    workspace = tmp_path / "vera-workspace"
+    workspace.mkdir()
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'[instances]\nexp2res = "{workspace}"\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(retro_adapter, "CONFIG_PATH", config)
+    assert retro_adapter.configured_private_root() == workspace
+    config.write_text("not = valid = toml", encoding="utf-8")
+    with pytest.raises(retro_adapter.AdapterError):
+        retro_adapter.configured_private_root()
 
 
 def test_cli_refuses_overwriting_the_export(tmp_path, capsys):

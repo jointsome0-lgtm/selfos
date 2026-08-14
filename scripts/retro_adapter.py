@@ -19,8 +19,9 @@ grammar refuses rejects that record with a reason — never an approximation.
 The run report (stdout, one JSON object) carries counts and per-record
 reason codes only, never entry text. The output file is the delivery
 payload and the only copy the adapter produces: it must live on a private
-instance path (an output inside a public engine checkout is refused), and
-the owner deletes it once the import report is confirmed.
+instance path (inside the configured exp2res root when one is set; never
+inside a public engine checkout), and the owner deletes it once the
+import report is confirmed.
 
 Requires the ``exp2res`` package to be importable (installed, or its
 checkout on ``PYTHONPATH``). Contracts: exp2res ``spec/19-integration-
@@ -32,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +50,8 @@ RETRO_EVENT_TYPES = frozenset(
 SUPPORTED_PAYLOAD_VERSION = 1
 RECORD_ID_PREFIX = "ephemeris:retro:"
 PUBLIC_SIBLINGS = ("ephemeris", "atlas", "exp2res", "tollgate", "selfos-skills")
+ENV_VAR = "EXP2RES_WORKSPACE"
+CONFIG_PATH = Path.home() / ".config" / "selfos" / "config.toml"
 
 
 class AdapterError(RuntimeError):
@@ -249,18 +253,66 @@ def run(text: str, timezone_name: str) -> tuple[list[dict], dict]:
     return records, report
 
 
+def configured_private_root() -> Path | None:
+    """The exp2res private root, by the docs/instance.md discovery order.
+
+    ``EXP2RES_WORKSPACE`` first, then ``instances.exp2res`` in the user
+    config. A config that exists but cannot be read or parsed refuses the
+    run rather than silently weakening the output boundary.
+    """
+    value = os.environ.get(ENV_VAR)
+    if value:
+        return Path(value)
+    if not CONFIG_PATH.is_file():
+        return None
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib
+        except ModuleNotFoundError as exc:
+            raise AdapterError(
+                f"{CONFIG_PATH} exists but no TOML parser is available; "
+                "run under Python 3.11+ or install tomli"
+            ) from exc
+    try:
+        data = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise AdapterError(f"cannot read {CONFIG_PATH}: {exc}") from exc
+    instances = data.get("instances")
+    if not isinstance(instances, dict):
+        return None
+    configured = instances.get("exp2res")
+    if not isinstance(configured, str) or not configured:
+        return None
+    return Path(configured)
+
+
 def refuse_public_output(output: Path, export: Path) -> None:
     """Adapters write only to private instance paths (AGENTS.md, docs/instance.md).
 
-    The deny set is every public engine checkout the AGENTS.md map names:
-    this repository plus its documented siblings. The export itself is also
-    refused as a destination so a typo cannot truncate the source.
+    When an exp2res private root is configured (``EXP2RES_WORKSPACE`` or
+    ``instances.exp2res`` in the user config), the output must resolve
+    inside it. With no root configured — capture is still blocked by
+    design, so only invented-data runs exist — the fallback boundary is a
+    deny set of every public engine checkout the AGENTS.md map names. The
+    export itself is also refused as a destination so a typo cannot
+    truncate the source.
     """
     resolved = output.resolve()
     if resolved == export.resolve():
         raise AdapterError(
             f"output path {output} is the export itself; refusing to "
             "overwrite the source"
+        )
+    private_root = configured_private_root()
+    if private_root is not None and not resolved.is_relative_to(
+        private_root.resolve()
+    ):
+        raise AdapterError(
+            f"output path {output} is outside the configured exp2res "
+            f"private root {private_root}; write the payload there "
+            "(docs/instance.md)"
         )
     root = Path(__file__).resolve().parents[1]
     roots = [root]

@@ -24,12 +24,17 @@ text.
 
 The output file is the delivery payload and the only content copy the
 adapter produces (deletion-contract rule, #25). Both ends of the handoff
-are explicit: the adapter refuses an `-o` path that resolves inside any
-public engine checkout the AGENTS.md map names (adapters operate only on
-private instance paths, [instance.md](instance.md)) or onto the export
-itself, and once the import report is confirmed the
-owner deletes the payload file — it is a transient handoff artifact, not
-a second store, and nothing else retains shipped entry text outside the
+are explicit. When an exp2res private root is configured
+(`EXP2RES_WORKSPACE`, then `instances.exp2res` in
+`~/.config/selfos/config.toml` — the [instance.md](instance.md)
+discovery order), the `-o` path must resolve inside that root: adapters
+operate only on explicitly configured private-instance paths. With no
+root configured — real capture is still blocked by design, so only
+invented-data runs exist — the adapter still refuses an `-o` path
+inside any public engine checkout the AGENTS.md map names, or onto the
+export itself. Once the import report is confirmed the owner deletes
+the payload file — it is a transient handoff artifact, not a second
+store, and nothing else retains shipped entry text outside the
 receiving workspace.
 
 ## Selection
