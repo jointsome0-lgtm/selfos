@@ -46,10 +46,13 @@ delivers exports as browser downloads. The payload is written to a
 fresh owner-only (`0600`) staging file (`<output>.tmp`) that atomically
 replaces the destination name — an existing destination's inode is
 never truncated in place, so a hard-linked alias of it never receives
-the payload. A staging file left behind by an interrupted run is
-identified and refused at startup, never silently deleted or
-overwritten: it may hold a payload, so the owner inspects and deletes
-it before rerunning.
+the payload. The output-side checks run against a pinned descriptor of
+the output's directory, and the staging write and atomic replace go
+through that same descriptor — so a parent directory swapped between
+check and write cannot redirect the payload. A staging file left behind
+by an interrupted run is identified and refused at startup, never
+silently deleted or overwritten: it may hold a payload, so the owner
+inspects and deletes it before rerunning.
 Once the import report is confirmed the owner deletes
 the payload file — it is a transient handoff artifact, not a second
 store, and nothing else retains shipped entry text outside the

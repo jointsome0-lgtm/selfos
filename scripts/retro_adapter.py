@@ -351,8 +351,14 @@ def refuse_unsafe_paths(
     *,
     instance: str | None = None,
     allow_unconfigured: bool = False,
-) -> None:
+) -> int:
     """Adapters operate only on private instance paths (AGENTS.md, docs/instance.md).
+
+    Returns an open descriptor of the output's directory, and every
+    output-side check runs against that pinned descriptor's actual
+    identity: the caller writes through it, so a parent component
+    swapped between check and write cannot redirect the payload. The
+    caller owns closing the descriptor.
 
     Neither the export nor the output may lie inside a public engine
     checkout the AGENTS.md map names. When an exp2res private root is
@@ -405,30 +411,61 @@ def refuse_unsafe_paths(
                 "existing directory; a root that names a file would itself "
                 "be overwritten by the payload (docs/instance.md)"
             )
-        # The payload lands at the output *name* (atomic replace), so the
-        # name's own directory must sit inside the root too — a symlink
-        # outside the root pointing inside it would otherwise leave the
-        # payload at the symlink's location.
-        name_parent = Path(os.path.abspath(output)).parent.resolve()
-        if (
-            resolved_output == resolved_root
-            or not resolved_output.is_relative_to(resolved_root)
-            or not name_parent.is_relative_to(resolved_root)
-        ):
-            raise AdapterError(
-                f"output path {output} is not strictly beneath the "
-                f"configured exp2res private root {private_root}, as both "
-                "the written name and its resolved target must be; write "
-                "the payload there (docs/instance.md)"
-            )
-    _refuse_inside_public(output, resolved_output, "output")
-    staging = Path(str(output) + ".tmp")
-    if staging.exists() or staging.is_symlink():
+    parent = Path(os.path.abspath(output)).parent
+    try:
+        dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
         raise AdapterError(
-            f"staging file {staging} already exists — likely a payload "
-            "left by an interrupted run; inspect and delete it before "
-            "rerunning"
-        )
+            f"cannot open the output directory {parent}: {exc}"
+        ) from exc
+    try:
+        # The checks below run on the descriptor's actual directory, not
+        # a re-traversed path, and the caller writes through the same
+        # descriptor — so what was checked is what is written to.
+        try:
+            pinned_parent = Path(os.readlink(f"/proc/self/fd/{dir_fd}"))
+        except OSError:
+            pinned_parent = parent.resolve()
+            if not os.path.samestat(os.fstat(dir_fd), os.stat(pinned_parent)):
+                raise AdapterError(
+                    f"the output directory {parent} changed while being "
+                    "verified; refusing to write"
+                ) from None
+        pinned_output = pinned_parent / output.name
+        if private_root is not None:
+            # The payload lands at the output *name* (atomic replace), so
+            # the name's own directory must sit inside the root too — a
+            # symlink outside the root pointing inside it would otherwise
+            # leave the payload at the symlink's location.
+            resolved_root = private_root.resolve()
+            if (
+                resolved_output == resolved_root
+                or not resolved_output.is_relative_to(resolved_root)
+                or not pinned_parent.is_relative_to(resolved_root)
+            ):
+                raise AdapterError(
+                    f"output path {output} is not strictly beneath the "
+                    f"configured exp2res private root {private_root}, as "
+                    "both the written name and its resolved target must "
+                    "be; write the payload there (docs/instance.md)"
+                )
+        _refuse_inside_public(output, resolved_output, "output")
+        _refuse_inside_public(output, pinned_output, "output")
+        staging_name = output.name + ".tmp"
+        try:
+            os.stat(staging_name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AdapterError(
+                f"staging file {pinned_parent / staging_name} already "
+                "exists — likely a payload left by an interrupted run; "
+                "inspect and delete it before rerunning"
+            )
+    except BaseException:
+        os.close(dir_fd)
+        raise
+    return dir_fd
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -468,7 +505,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        refuse_unsafe_paths(
+        dir_fd = refuse_unsafe_paths(
             Path(args.output),
             Path(args.export_path),
             instance=args.instance,
@@ -478,41 +515,55 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     try:
-        text = Path(args.export_path).read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
-        print(f"error: cannot read export: {exc}", file=sys.stderr)
-        return 2
-    try:
-        records, report = run(text, args.timezone)
-    except AdapterError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    # The payload lands in a fresh owner-only file that atomically
-    # replaces the destination name: truncating an existing destination
-    # in place would follow a hard-linked alias's shared inode, and an
-    # alias never receives the payload.
-    staging = args.output + ".tmp"
-    try:
-        body = "".join(
-            json.dumps(r, ensure_ascii=False) + "\n" for r in records
-        ).encode("utf-8")
-        fd = os.open(
-            staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-        )
         try:
-            with os.fdopen(fd, "wb") as handle:
-                os.fchmod(handle.fileno(), 0o600)
-                handle.write(body)
-            os.replace(staging, args.output)
-        except BaseException:
+            text = Path(args.export_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            print(f"error: cannot read export: {exc}", file=sys.stderr)
+            return 2
+        try:
+            records, report = run(text, args.timezone)
+        except AdapterError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        # The payload lands in a fresh owner-only file that atomically
+        # replaces the destination name: truncating an existing
+        # destination in place would follow a hard-linked alias's shared
+        # inode, and an alias never receives the payload. Both steps go
+        # through the pinned directory descriptor the path guard
+        # verified, so a parent swapped mid-run cannot redirect them.
+        out_name = Path(args.output).name
+        staging_name = out_name + ".tmp"
+        try:
+            body = "".join(
+                json.dumps(r, ensure_ascii=False) + "\n" for r in records
+            ).encode("utf-8")
+            fd = os.open(
+                staging_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=dir_fd,
+            )
             try:
-                os.unlink(staging)
-            except OSError:
-                pass
-            raise
-    except (OSError, UnicodeError) as exc:
-        print(f"error: cannot write output: {exc}", file=sys.stderr)
-        return 2
+                with os.fdopen(fd, "wb") as handle:
+                    os.fchmod(handle.fileno(), 0o600)
+                    handle.write(body)
+                os.replace(
+                    staging_name,
+                    out_name,
+                    src_dir_fd=dir_fd,
+                    dst_dir_fd=dir_fd,
+                )
+            except BaseException:
+                try:
+                    os.unlink(staging_name, dir_fd=dir_fd)
+                except OSError:
+                    pass
+                raise
+        except (OSError, UnicodeError) as exc:
+            print(f"error: cannot write output: {exc}", file=sys.stderr)
+            return 2
+    finally:
+        os.close(dir_fd)
     print(json.dumps(report, indent=2))
     return 0
 

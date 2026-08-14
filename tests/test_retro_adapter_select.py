@@ -466,6 +466,23 @@ def test_a_leftover_staging_file_is_identified_and_refused(tmp_path, capsys):
     assert not output.exists()
 
 
+def test_path_guard_returns_a_pinned_descriptor_of_the_output_directory(
+    tmp_path,
+):
+    export = tmp_path / "events-export.jsonl"
+    export.write_text(
+        export_line("retro_entry_created", snapshot("uuid-a")) + "\n",
+        encoding="utf-8",
+    )
+    dir_fd = retro_adapter.refuse_unsafe_paths(
+        tmp_path / "vera-out.jsonl", export, allow_unconfigured=True
+    )
+    try:
+        assert os.path.samestat(os.fstat(dir_fd), os.stat(tmp_path))
+    finally:
+        os.close(dir_fd)
+
+
 def test_instance_flag_does_not_bypass_the_public_guard(tmp_path, capsys):
     export = tmp_path / "events-export.jsonl"
     export.write_text(
