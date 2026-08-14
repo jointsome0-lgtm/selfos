@@ -32,7 +32,11 @@ operate only on explicitly configured private-instance paths. With no
 root configured — real capture is still blocked by design, so only
 invented-data runs exist — the adapter still refuses an `-o` path
 inside any public engine checkout the AGENTS.md map names, or onto the
-export itself. Once the import report is confirmed the owner deletes
+export itself (symlink and hard-link aliases included). The export is
+likewise refused as a source when it resolves inside a public checkout;
+it is not required to sit inside an ephemeris root, because ephemeris
+delivers exports as browser downloads. Once the import report is
+confirmed the owner deletes
 the payload file — it is a transient handoff artifact, not a second
 store, and nothing else retains shipped entry text outside the
 receiving workspace.
@@ -101,9 +105,10 @@ never per edit.
 | Class | Reason | Meaning |
 |---|---|---|
 | skipped | `archived` | latest snapshot is archived |
-| skipped | `no_project` | §19.1 requires a project label |
+| skipped | `no_project` | the entry has no project (`null` or blank) and §19.1 requires one |
 | rejected | `period_unparsable:<code>` | exp2res grammar refused `period_raw` (grammar drift) |
-| rejected | `invalid_snapshot` | snapshot field types are not the sec33 wire shape, or the latest event's archive transition contradicts its own snapshot (`retro_entry_archived` without `archived_at`, `retro_entry_unarchived` with it) |
+| rejected | `invalid_snapshot` | snapshot field types are not the sec33 wire shape (a non-string `project` included), or the latest event's archive transition contradicts its own snapshot (`retro_entry_archived` without `archived_at`, `retro_entry_unarchived` with it) |
+| rejected | `text_not_encodable` | the record cannot be encoded as UTF-8 (e.g. an unpaired surrogate in a corrupted export) |
 | rejected | `unsupported_payload_version` | some event of this identity carries an unknown `payload_version`; the whole entry is rejected (per line only when the line names no identity) |
 | rejected | `payload_not_object`, `missing_retro_uuid`, `line_not_json`, `line_not_event` | malformed export line (reported with its physical line number) |
 

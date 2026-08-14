@@ -135,6 +135,31 @@ def test_contradictory_archive_transition_is_rejected():
     ] == [("uuid-a", "invalid_snapshot"), ("uuid-b", "invalid_snapshot")]
 
 
+def test_non_string_project_is_schema_corruption_not_no_project():
+    records, report = run(
+        export_line("retro_entry_created", snapshot("uuid-a", project=42)),
+        export_line("retro_entry_created", snapshot("uuid-b", project=None)),
+    )
+    assert records == []
+    assert [
+        (entry["retro_uuid"], entry["reason"]) for entry in report["rejected"]
+    ] == [("uuid-a", "invalid_snapshot")]
+    assert [
+        (entry["retro_uuid"], entry["reason"]) for entry in report["skipped"]
+    ] == [("uuid-b", "no_project")]
+
+
+def test_unencodable_text_is_rejected_before_the_output_is_written():
+    records, report = run(
+        export_line("retro_entry_created", snapshot("uuid-a", text="\ud800")),
+        export_line("retro_entry_created", snapshot("uuid-b")),
+    )
+    assert [r["record_id"] for r in records] == ["ephemeris:retro:uuid-b"]
+    assert [
+        (entry["retro_uuid"], entry["reason"]) for entry in report["rejected"]
+    ] == [("uuid-a", "text_not_encodable")]
+
+
 def test_unknown_precision_resolves_to_an_open_occurred():
     records, _ = run(
         export_line(

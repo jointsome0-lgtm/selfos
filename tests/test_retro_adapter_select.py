@@ -9,6 +9,7 @@ data is invented for the Vera Example persona.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -211,6 +212,37 @@ def test_cli_refuses_overwriting_the_export(tmp_path, capsys):
     assert exit_code == 2
     assert "refusing to overwrite the source" in capsys.readouterr().err
     assert "retro_entry_created" in export.read_text(encoding="utf-8")
+
+
+def test_cli_refuses_a_hard_linked_alias_of_the_export(tmp_path, capsys):
+    export = tmp_path / "events-export.jsonl"
+    export.write_text(
+        export_line("retro_entry_created", snapshot("uuid-a")) + "\n",
+        encoding="utf-8",
+    )
+    alias = tmp_path / "hard-alias.jsonl"
+    os.link(export, alias)
+    exit_code = retro_adapter.main(
+        [str(export), "--timezone", "Europe/Berlin", "-o", str(alias)]
+    )
+    assert exit_code == 2
+    assert "refusing to overwrite the source" in capsys.readouterr().err
+    assert "retro_entry_created" in export.read_text(encoding="utf-8")
+
+
+def test_cli_refuses_an_export_inside_a_public_checkout(tmp_path, capsys):
+    public_root = Path(retro_adapter.__file__).resolve().parents[1]
+    exit_code = retro_adapter.main(
+        [
+            str(public_root / "vera-export.jsonl"),
+            "--timezone",
+            "Europe/Berlin",
+            "-o",
+            str(tmp_path / "vera-out.jsonl"),
+        ]
+    )
+    assert exit_code == 2
+    assert "public checkout" in capsys.readouterr().err
 
 
 def test_cli_refuses_an_undecodable_export(tmp_path, capsys):

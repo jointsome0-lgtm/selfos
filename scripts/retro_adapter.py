@@ -191,7 +191,10 @@ def build_records(
             skipped.append({**identity, "reason": "archived"})
             continue
         project = snapshot.get("project")
-        if not isinstance(project, str) or not project.strip():
+        if project is not None and not isinstance(project, str):
+            rejected.append({**identity, "reason": "invalid_snapshot"})
+            continue
+        if project is None or not project.strip():
             skipped.append({**identity, "reason": "no_project"})
             continue
         text = snapshot.get("text")
@@ -218,16 +221,20 @@ def build_records(
             code = getattr(exc, "diagnostic_class", "invalid_input")
             rejected.append({**identity, "reason": f"period_unparsable:{code}"})
             continue
-        records.append(
-            {
-                "source": "ephemeris",
-                "record_id": identity["record_id"],
-                "domain": "activity",
-                "occurred": occurred.model_dump(mode="json"),
-                "project": project,
-                "text": text,
-            }
-        )
+        record = {
+            "source": "ephemeris",
+            "record_id": identity["record_id"],
+            "domain": "activity",
+            "occurred": occurred.model_dump(mode="json"),
+            "project": project,
+            "text": text,
+        }
+        try:
+            json.dumps(record, ensure_ascii=False).encode("utf-8")
+        except UnicodeError:
+            rejected.append({**identity, "reason": "text_not_encodable"})
+            continue
+        records.append(record)
         accepted.append(identity)
     return records, accepted, skipped, rejected
 
@@ -288,25 +295,53 @@ def configured_private_root() -> Path | None:
     return Path(configured)
 
 
-def refuse_public_output(output: Path, export: Path) -> None:
-    """Adapters write only to private instance paths (AGENTS.md, docs/instance.md).
+def _public_roots() -> list[Path]:
+    root = Path(__file__).resolve().parents[1]
+    roots = [root]
+    for name in PUBLIC_SIBLINGS:
+        sibling = root.parent / name
+        if sibling.is_dir():
+            roots.append(sibling.resolve())
+    return roots
 
-    When an exp2res private root is configured (``EXP2RES_WORKSPACE`` or
-    ``instances.exp2res`` in the user config), the output must resolve
-    inside it. With no root configured — capture is still blocked by
-    design, so only invented-data runs exist — the fallback boundary is a
-    deny set of every public engine checkout the AGENTS.md map names. The
-    export itself is also refused as a destination so a typo cannot
-    truncate the source.
+
+def _refuse_inside_public(path: Path, resolved: Path, role: str) -> None:
+    for public_root in _public_roots():
+        if resolved.is_relative_to(public_root):
+            raise AdapterError(
+                f"{role} path {path} resolves inside the public checkout "
+                f"{public_root}; a public checkout is never a data source "
+                "or destination (docs/instance.md)"
+            )
+
+
+def refuse_unsafe_paths(output: Path, export: Path) -> None:
+    """Adapters operate only on private instance paths (AGENTS.md, docs/instance.md).
+
+    Neither the export nor the output may resolve inside a public engine
+    checkout the AGENTS.md map names. When an exp2res private root is
+    configured (``EXP2RES_WORKSPACE`` or ``instances.exp2res`` in the user
+    config), the output must additionally resolve inside it; with no root
+    configured — capture is still blocked by design, so only invented-data
+    runs exist — the deny set is the whole boundary. The export is never
+    required to sit inside an ephemeris root: ephemeris delivers exports
+    as browser downloads. The export is also refused as the output
+    destination, through symlink and hard-link aliases alike, so a typo
+    cannot truncate the source.
     """
-    resolved = output.resolve()
-    if resolved == export.resolve():
+    resolved_output = output.resolve()
+    resolved_export = export.resolve()
+    same_file = resolved_output == resolved_export
+    if not same_file and output.exists() and export.exists():
+        same_file = os.path.samefile(output, export)
+    if same_file:
         raise AdapterError(
             f"output path {output} is the export itself; refusing to "
             "overwrite the source"
         )
+    _refuse_inside_public(export, resolved_export, "export")
     private_root = configured_private_root()
-    if private_root is not None and not resolved.is_relative_to(
+    if private_root is not None and not resolved_output.is_relative_to(
         private_root.resolve()
     ):
         raise AdapterError(
@@ -314,19 +349,7 @@ def refuse_public_output(output: Path, export: Path) -> None:
             f"private root {private_root}; write the payload there "
             "(docs/instance.md)"
         )
-    root = Path(__file__).resolve().parents[1]
-    roots = [root]
-    for name in PUBLIC_SIBLINGS:
-        sibling = root.parent / name
-        if sibling.is_dir():
-            roots.append(sibling.resolve())
-    for public_root in roots:
-        if resolved.is_relative_to(public_root):
-            raise AdapterError(
-                f"output path {output} resolves inside the public checkout "
-                f"{public_root}; write the payload to a private instance "
-                "path (docs/instance.md)"
-            )
+    _refuse_inside_public(output, resolved_output, "output")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -350,7 +373,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        refuse_public_output(Path(args.output), Path(args.export_path))
+        refuse_unsafe_paths(Path(args.output), Path(args.export_path))
     except AdapterError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -364,10 +387,12 @@ def main(argv: list[str] | None = None) -> int:
     except AdapterError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    body = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records)
     try:
-        Path(args.output).write_text(body, encoding="utf-8")
-    except OSError as exc:
+        body = "".join(
+            json.dumps(r, ensure_ascii=False) + "\n" for r in records
+        ).encode("utf-8")
+        Path(args.output).write_bytes(body)
+    except (OSError, UnicodeError) as exc:
         print(f"error: cannot write output: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(report, ensure_ascii=False, indent=2))
