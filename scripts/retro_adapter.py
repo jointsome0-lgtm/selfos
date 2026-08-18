@@ -1,20 +1,29 @@
-"""Ephemeris retro export -> Exp2Res §19.1 JSONL adapter (issue #37).
+"""Ephemeris retro/diary export -> Exp2Res §19.1 JSONL adapter (issue #37).
 
 Reads an ephemeris audit-export JSONL file, selects the retro-entry slice
-(``retro_entry_*`` events, grouped by ``retro_uuid``, latest event in file
-order wins, entries whose latest snapshot is archived excluded), and emits
-one closed §19.1 activity-domain record per surviving entry, ready for
-``exp2res import ephemeris``:
+(``retro_entry_*`` events, grouped by ``retro_uuid``) and the diary-entry
+slice (``diary_entry_*`` events, grouped by ``diary_uuid``) — latest event
+in file order wins, entries whose latest snapshot is archived excluded —
+and emits one closed §19.1 activity-domain record per surviving entry,
+ready for ``exp2res import ephemeris``:
 
     python scripts/retro_adapter.py <export.jsonl> --timezone <IANA> -o <out.jsonl>
 
+The adapter is the primary privacy gate of the docs/tags.md route/deny
+table: a diary entry whose *any* event snapshot carries ``private: true``
+is denied history-wide (once private, never shipped — the one-way latch),
+reported content-free by ``diary_uuid`` only, and never written to the
+output.
+
 Deterministic only: no model call, no network, no state, and entry text is
-data that never alters behaviour. ``occurred`` is resolved from the
+data that never alters behaviour. Retro ``occurred`` is resolved from the
 owner-typed ``period_raw`` + ``precision`` + ``confidence`` with exp2res's
 own grammar (``exp2res.services.time_input.parse_occurred``), so acceptance
 is equal by construction; ``period_start``/``period_end`` are
-ephemeris-local display derivations and are never read. A period the
-grammar refuses rejects that record with a reason — never an approximation.
+ephemeris-local display derivations and are never read. Diary ``occurred``
+resolves the owner-picked ``entry_date`` through the same grammar at
+``exact_day`` precision. A value the grammar refuses rejects that record
+with a reason — never an approximation.
 
 The run report (stdout, one JSON object) carries counts and per-record
 reason codes only, never entry text. The output file is the delivery
@@ -25,7 +34,8 @@ import report is confirmed.
 
 Requires the ``exp2res`` package to be importable (installed, or its
 checkout on ``PYTHONPATH``). Contracts: exp2res ``spec/19-integration-
-contracts.md`` §19.1/§19.4, ephemeris ``docs/retro-spec.md`` (sec33);
+contracts.md`` §19.1/§19.4, ephemeris ``docs/retro-spec.md`` (sec33) and
+``docs/diary-spec.md`` (sec35), selfos ``docs/tags.md`` (route/deny v1);
 field mapping and decisions in ``docs/retro-adapter.md``.
 """
 
@@ -34,6 +44,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,8 +58,20 @@ RETRO_EVENT_TYPES = frozenset(
         "retro_entry_unarchived",
     )
 )
+DIARY_EVENT_TYPES = frozenset(
+    (
+        "diary_entry_created",
+        "diary_entry_updated",
+        "diary_entry_archived",
+        "diary_entry_unarchived",
+    )
+)
 SUPPORTED_PAYLOAD_VERSION = 1
 RECORD_ID_PREFIX = "ephemeris:retro:"
+DIARY_RECORD_ID_PREFIX = "ephemeris:diary:"
+DIARY_PROJECT = "diary"
+DIARY_CONFIDENCE = "high"
+ENTRY_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 PUBLIC_SIBLINGS = ("ephemeris", "atlas", "exp2res", "tollgate", "selfos-skills")
 ENV_VAR = "EXP2RES_WORKSPACE"
 CONFIG_PATH = Path.home() / ".config" / "selfos" / "config.toml"
@@ -73,42 +96,61 @@ def _time_grammar():
 
 @dataclass
 class Selection:
-    """The retro slice of one export: latest snapshot per entry."""
+    """The retro and diary slices of one export: latest snapshot per entry."""
 
     snapshots: dict[str, dict]
     latest_types: dict[str, str]
     rejected_entries: list[dict]
     ignored_lines: int
+    diary_snapshots: dict[str, dict]
+    diary_latest_types: dict[str, str]
+    diary_private: dict[str, None]
+    diary_privacy_unreadable: frozenset[str]
 
 
-def _payload_uuid(event: dict) -> str | None:
+def _payload_uuid(event: dict, key: str) -> str | None:
     payload = event.get("payload")
     if not isinstance(payload, dict):
         return None
-    retro_uuid = payload.get("retro_uuid")
-    if not isinstance(retro_uuid, str) or not retro_uuid:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value:
         return None
-    return retro_uuid
+    return value
 
 
 def select_snapshots(text: str) -> Selection:
-    """Group ``retro_entry_*`` lines by ``retro_uuid``; latest line wins.
+    """Group lifecycle lines by entry uuid per slice; latest line wins.
 
-    An identity that carries any event with an unsupported payload version
-    is rejected whole: its latest state is unreadable, so no earlier
-    snapshot may stand in for it. A retro event with no attributable
-    ``retro_uuid`` refuses the whole run for the same reason, with no
-    identity to pin the damage to — and so does any line that is not a
-    JSON event object at all, because a corrupted line cannot be proven
-    non-retro and could hide an edit or archive, and any unknown
-    ``retro_entry_*`` type, because a newer lifecycle event could change
+    ``retro_entry_*`` events group by ``retro_uuid``, ``diary_entry_*``
+    events by ``diary_uuid``; the slices never mix. An identity that
+    carries any event with an unsupported payload version is rejected
+    whole: its latest state is unreadable, so no earlier snapshot may
+    stand in for it. A lifecycle event with no attributable uuid refuses
+    the whole run for the same reason, with no identity to pin the damage
+    to — and so does any line that is not a JSON event object at all,
+    because a corrupted line cannot be proven outside both slices and
+    could hide an edit or archive, and any unknown ``retro_entry_*`` or
+    ``diary_entry_*`` type, because a newer lifecycle event could change
     the selected state of any entry. Line numbers are physical (blank
-    lines count, matching a text editor); non-retro event types are
-    counted, never reported per line.
+    lines count, matching a text editor); event types outside both slices
+    are counted, never reported per line.
+
+    The diary ``private`` latch is history-wide and read before the
+    version gate: any diary event whose payload says ``private: true`` —
+    a poisoned version included, because denying is always the safe
+    direction — latches its identity as denied. A valid diary event whose
+    ``private`` value is not a JSON boolean marks the identity's privacy
+    state unreadable, and an entry whose privacy cannot be read is never
+    shipped.
     """
     snapshots: dict[str, dict] = {}
     latest_types: dict[str, str] = {}
     poisoned: dict[str, None] = {}
+    diary_snapshots: dict[str, dict] = {}
+    diary_latest_types: dict[str, str] = {}
+    diary_poisoned: dict[str, None] = {}
+    diary_private: dict[str, None] = {}
+    diary_unreadable: set[str] = set()
     ignored = 0
     for number, line in enumerate(text.split("\n"), 1):
         if not line.strip():
@@ -119,47 +161,72 @@ def select_snapshots(text: str) -> Selection:
             raise AdapterError(
                 f"line {number} is not JSON; refusing the whole export, "
                 "because a corrupted line cannot be proven non-retro and "
-                "could hide an edit or archive of some entry"
+                "non-diary and could hide an edit or archive of some entry"
             ) from None
         if not isinstance(event, dict) or not isinstance(event.get("type"), str):
             raise AdapterError(
                 f"line {number} is not an event object; refusing the whole "
                 "export, because an unreadable line cannot be proven "
-                "non-retro and could hide an edit or archive of some entry"
+                "non-retro and non-diary and could hide an edit or archive "
+                "of some entry"
             )
-        if event["type"] not in RETRO_EVENT_TYPES:
-            if event["type"].startswith("retro_entry_"):
+        event_type = event["type"]
+        if event_type in RETRO_EVENT_TYPES:
+            slice_name, uuid_key = "retro", "retro_uuid"
+            slice_snapshots, slice_types, slice_poisoned = (
+                snapshots,
+                latest_types,
+                poisoned,
+            )
+        elif event_type in DIARY_EVENT_TYPES:
+            slice_name, uuid_key = "diary", "diary_uuid"
+            slice_snapshots, slice_types, slice_poisoned = (
+                diary_snapshots,
+                diary_latest_types,
+                diary_poisoned,
+            )
+        else:
+            if event_type.startswith(("retro_entry_", "diary_entry_")):
+                family = (
+                    "retro" if event_type.startswith("retro_entry_") else "diary"
+                )
                 raise AdapterError(
-                    f"line {number}: unknown retro lifecycle event type "
-                    f"{event['type']!r}; the export speaks a newer retro "
+                    f"line {number}: unknown {family} lifecycle event type "
+                    f"{event_type!r}; the export speaks a newer {family} "
                     "contract than this adapter supports, and an unknown "
                     "lifecycle event could change the selected state of "
                     "any entry"
                 )
             ignored += 1
             continue
-        retro_uuid = _payload_uuid(event)
-        if retro_uuid is None:
+        entry_uuid = _payload_uuid(event, uuid_key)
+        if entry_uuid is None:
             raise AdapterError(
-                f"line {number}: a retro event carries no attributable "
-                "retro_uuid; refusing the whole export, because an "
+                f"line {number}: a {slice_name} event carries no attributable "
+                f"{uuid_key}; refusing the whole export, because an "
                 "unattributable lifecycle event could hide an edit or "
                 "archive of some entry"
             )
+        if slice_name == "diary" and event["payload"].get("private") is True:
+            diary_private.setdefault(entry_uuid)
         version = event.get("payload_version")
         if (
             not isinstance(version, int)
             or isinstance(version, bool)
             or version != SUPPORTED_PAYLOAD_VERSION
         ):
-            poisoned.setdefault(retro_uuid)
-            snapshots.pop(retro_uuid, None)
-            latest_types.pop(retro_uuid, None)
+            slice_poisoned.setdefault(entry_uuid)
+            slice_snapshots.pop(entry_uuid, None)
+            slice_types.pop(entry_uuid, None)
             continue
-        if retro_uuid in poisoned:
+        if entry_uuid in slice_poisoned:
             continue
-        snapshots[retro_uuid] = event["payload"]
-        latest_types[retro_uuid] = event["type"]
+        if slice_name == "diary" and not isinstance(
+            event["payload"].get("private"), bool
+        ):
+            diary_unreadable.add(entry_uuid)
+        slice_snapshots[entry_uuid] = event["payload"]
+        slice_types[entry_uuid] = event_type
     rejected_entries = [
         {
             "retro_uuid": retro_uuid,
@@ -167,19 +234,36 @@ def select_snapshots(text: str) -> Selection:
             "reason": "unsupported_payload_version",
         }
         for retro_uuid in poisoned
+    ] + [
+        {
+            "diary_uuid": diary_uuid,
+            "record_id": DIARY_RECORD_ID_PREFIX + diary_uuid,
+            "reason": "unsupported_payload_version",
+        }
+        for diary_uuid in diary_poisoned
+        if diary_uuid not in diary_private
     ]
     return Selection(
         snapshots=snapshots,
         latest_types=latest_types,
         rejected_entries=rejected_entries,
         ignored_lines=ignored,
+        diary_snapshots=diary_snapshots,
+        diary_latest_types=diary_latest_types,
+        diary_private=diary_private,
+        diary_privacy_unreadable=frozenset(diary_unreadable),
     )
 
 
 def build_records(
     selection: Selection, timezone_name: str
-) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
-    """Map surviving snapshots to §19.1 records; report the rest by reason."""
+) -> tuple[list[dict], list[dict], list[dict], list[dict], list[dict]]:
+    """Map surviving snapshots to §19.1 records; report the rest by reason.
+
+    Output order is deterministic: every retro record first, then every
+    diary record, each slice in first-seen export order — a rerun over an
+    unchanged export is byte-identical.
+    """
     parse_occurred, workspace_zone, Exp2ResError = _time_grammar()
     try:
         workspace_zone(timezone_name)
@@ -192,6 +276,10 @@ def build_records(
     accepted: list[dict] = []
     skipped: list[dict] = []
     rejected: list[dict] = []
+    denied: list[dict] = [
+        {"diary_uuid": diary_uuid, "reason": "private"}
+        for diary_uuid in selection.diary_private
+    ]
     for retro_uuid, snapshot in selection.snapshots.items():
         identity = {
             "retro_uuid": retro_uuid,
@@ -257,13 +345,75 @@ def build_records(
             continue
         records.append(record)
         accepted.append(identity)
-    return records, accepted, skipped, rejected
+    for diary_uuid, snapshot in selection.diary_snapshots.items():
+        if diary_uuid in selection.diary_private:
+            continue
+        identity = {
+            "diary_uuid": diary_uuid,
+            "record_id": DIARY_RECORD_ID_PREFIX + diary_uuid,
+        }
+        if diary_uuid in selection.diary_privacy_unreadable:
+            rejected.append({**identity, "reason": "invalid_snapshot"})
+            continue
+        archived_at = snapshot.get("archived_at")
+        if archived_at is not None and not isinstance(archived_at, str):
+            rejected.append({**identity, "reason": "invalid_snapshot"})
+            continue
+        archived = archived_at is not None
+        event_type = selection.diary_latest_types[diary_uuid]
+        if (event_type == "diary_entry_archived" and not archived) or (
+            event_type == "diary_entry_unarchived" and archived
+        ):
+            rejected.append({**identity, "reason": "invalid_snapshot"})
+            continue
+        if archived:
+            skipped.append({**identity, "reason": "archived"})
+            continue
+        text = snapshot.get("text")
+        entry_date = snapshot.get("entry_date")
+        if (
+            not isinstance(text, str)
+            or not text
+            or not isinstance(entry_date, str)
+            or not ENTRY_DATE_PATTERN.fullmatch(entry_date)
+        ):
+            rejected.append({**identity, "reason": "invalid_snapshot"})
+            continue
+        try:
+            occurred = parse_occurred(
+                period=entry_date,
+                precision="exact_day",
+                confidence=DIARY_CONFIDENCE,
+                timezone_name=timezone_name,
+            )
+        except Exp2ResError as exc:
+            code = getattr(exc, "diagnostic_class", "invalid_input")
+            rejected.append(
+                {**identity, "reason": f"entry_date_unparsable:{code}"}
+            )
+            continue
+        record = {
+            "source": "ephemeris",
+            "record_id": identity["record_id"],
+            "domain": "activity",
+            "occurred": occurred.model_dump(mode="json"),
+            "project": DIARY_PROJECT,
+            "text": text,
+        }
+        try:
+            json.dumps(record, ensure_ascii=False).encode("utf-8")
+        except UnicodeError:
+            rejected.append({**identity, "reason": "text_not_encodable"})
+            continue
+        records.append(record)
+        accepted.append(identity)
+    return records, accepted, skipped, rejected, denied
 
 
 def run(text: str, timezone_name: str) -> tuple[list[dict], dict]:
     """Whole adapter pass: §19.1 records plus the machine-readable report."""
     selection = select_snapshots(text)
-    records, accepted, skipped, entry_rejected = build_records(
+    records, accepted, skipped, entry_rejected, denied = build_records(
         selection, timezone_name
     )
     rejected = selection.rejected_entries + entry_rejected
@@ -272,11 +422,13 @@ def run(text: str, timezone_name: str) -> tuple[list[dict], dict]:
             "accepted": len(accepted),
             "skipped": len(skipped),
             "rejected": len(rejected),
+            "denied": len(denied),
             "ignored_lines": selection.ignored_lines,
         },
         "accepted": accepted,
         "skipped": skipped,
         "rejected": rejected,
+        "denied": denied,
     }
     return records, report
 
@@ -501,8 +653,8 @@ def _pin_output_directory(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Map an ephemeris JSONL audit export's retro entries to "
-            "exp2res §19.1 activity records."
+            "Map an ephemeris JSONL audit export's retro and diary entries "
+            "to exp2res §19.1 activity records."
         )
     )
     parser.add_argument("export_path", help="ephemeris JSONL audit export")
