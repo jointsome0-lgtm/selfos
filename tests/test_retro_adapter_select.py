@@ -474,13 +474,38 @@ def test_path_guard_returns_a_pinned_descriptor_of_the_output_directory(
         export_line("retro_entry_created", snapshot("uuid-a")) + "\n",
         encoding="utf-8",
     )
-    dir_fd = retro_adapter.refuse_unsafe_paths(
+    export_fd, dir_fd = retro_adapter.refuse_unsafe_paths(
         tmp_path / "vera-out.jsonl", export, allow_unconfigured=True
     )
     try:
+        assert os.path.samestat(os.fstat(export_fd), os.stat(export))
         assert os.path.samestat(os.fstat(dir_fd), os.stat(tmp_path))
     finally:
+        os.close(export_fd)
         os.close(dir_fd)
+
+
+def test_a_staging_probe_failure_is_a_structured_cli_error(
+    tmp_path, capsys
+):
+    export = tmp_path / "events-export.jsonl"
+    export.write_text(
+        export_line("retro_entry_created", snapshot("uuid-a")) + "\n",
+        encoding="utf-8",
+    )
+    long_name = "v" * 246 + ".jsonl"
+    exit_code = retro_adapter.main(
+        [
+            str(export),
+            "--timezone",
+            "Europe/Berlin",
+            "-o",
+            str(tmp_path / long_name),
+            "--allow-unconfigured",
+        ]
+    )
+    assert exit_code == 2
+    assert "cannot probe the staging path" in capsys.readouterr().err
 
 
 def test_instance_flag_does_not_bypass_the_public_guard(tmp_path, capsys):

@@ -331,9 +331,6 @@ def _public_roots() -> list[Path]:
 
 
 def _refuse_inside_public(path: Path, resolved: Path, role: str) -> None:
-    # Both representations are checked: the symlink-resolved target and
-    # the pathname as given, so a payload is never reachable through a
-    # name inside a public checkout even when its target is private.
     lexical = Path(os.path.abspath(path))
     for public_root in _public_roots():
         for candidate in (lexical, resolved):
@@ -351,14 +348,15 @@ def refuse_unsafe_paths(
     *,
     instance: str | None = None,
     allow_unconfigured: bool = False,
-) -> int:
+) -> tuple[int, int]:
     """Adapters operate only on private instance paths (AGENTS.md, docs/instance.md).
 
-    Returns an open descriptor of the output's directory, and every
-    output-side check runs against that pinned descriptor's actual
-    identity: the caller writes through it, so a parent component
-    swapped between check and write cannot redirect the payload. The
-    caller owns closing the descriptor.
+    Returns ``(export_fd, dir_fd)``: an open descriptor of the export
+    and one of the output's directory. Every check runs against the
+    descriptors' actual identities, and the caller reads the export and
+    writes the payload through these same descriptors — so neither a
+    source retargeted nor a parent component swapped between check and
+    use can substitute a path. The caller owns closing both.
 
     Neither the export nor the output may lie inside a public engine
     checkout the AGENTS.md map names. When an exp2res private root is
@@ -378,17 +376,51 @@ def refuse_unsafe_paths(
     destination, through symlink and hard-link aliases alike, so a typo
     cannot truncate the source.
     """
-    resolved_output = output.resolve()
-    resolved_export = export.resolve()
-    same_file = resolved_output == resolved_export
-    if not same_file and output.exists() and export.exists():
-        same_file = os.path.samefile(output, export)
-    if same_file:
-        raise AdapterError(
-            f"output path {output} is the export itself; refusing to "
-            "overwrite the source"
+    _refuse_inside_public(export, export.resolve(), "export")
+    try:
+        export_fd = os.open(export, os.O_RDONLY)
+    except OSError as exc:
+        raise AdapterError(f"cannot open export {export}: {exc}") from exc
+    try:
+        export_stat = os.fstat(export_fd)
+        try:
+            pinned_export = Path(os.readlink(f"/proc/self/fd/{export_fd}"))
+        except OSError:
+            pinned_export = export.resolve()
+            if not os.path.samestat(export_stat, os.stat(pinned_export)):
+                raise AdapterError(
+                    f"the export {export} changed while being verified; "
+                    "refusing to read"
+                ) from None
+        _refuse_inside_public(export, pinned_export, "export")
+        resolved_output = output.resolve()
+        same_file = resolved_output == pinned_export
+        if not same_file and output.exists():
+            same_file = os.path.samestat(export_stat, os.stat(output))
+        if same_file:
+            raise AdapterError(
+                f"output path {output} is the export itself; refusing to "
+                "overwrite the source"
+            )
+        dir_fd = _pin_output_directory(
+            output,
+            resolved_output,
+            instance=instance,
+            allow_unconfigured=allow_unconfigured,
         )
-    _refuse_inside_public(export, resolved_export, "export")
+    except BaseException:
+        os.close(export_fd)
+        raise
+    return export_fd, dir_fd
+
+
+def _pin_output_directory(
+    output: Path,
+    resolved_output: Path,
+    *,
+    instance: str | None,
+    allow_unconfigured: bool,
+) -> int:
     private_root = configured_private_root(instance)
     if private_root is None:
         if not allow_unconfigured:
@@ -419,9 +451,6 @@ def refuse_unsafe_paths(
             f"cannot open the output directory {parent}: {exc}"
         ) from exc
     try:
-        # The checks below run on the descriptor's actual directory, not
-        # a re-traversed path, and the caller writes through the same
-        # descriptor — so what was checked is what is written to.
         try:
             pinned_parent = Path(os.readlink(f"/proc/self/fd/{dir_fd}"))
         except OSError:
@@ -433,10 +462,6 @@ def refuse_unsafe_paths(
                 ) from None
         pinned_output = pinned_parent / output.name
         if private_root is not None:
-            # The payload lands at the output *name* (atomic replace), so
-            # the name's own directory must sit inside the root too — a
-            # symlink outside the root pointing inside it would otherwise
-            # leave the payload at the symlink's location.
             resolved_root = private_root.resolve()
             if (
                 resolved_output == resolved_root
@@ -456,6 +481,11 @@ def refuse_unsafe_paths(
             os.stat(staging_name, dir_fd=dir_fd, follow_symlinks=False)
         except FileNotFoundError:
             pass
+        except OSError as exc:
+            raise AdapterError(
+                f"cannot probe the staging path "
+                f"{pinned_parent / staging_name}: {exc}"
+            ) from exc
         else:
             raise AdapterError(
                 f"staging file {pinned_parent / staging_name} already "
@@ -505,7 +535,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        dir_fd = refuse_unsafe_paths(
+        export_fd, dir_fd = refuse_unsafe_paths(
             Path(args.output),
             Path(args.export_path),
             instance=args.instance,
@@ -516,7 +546,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         try:
-            text = Path(args.export_path).read_text(encoding="utf-8")
+            with os.fdopen(export_fd, "rb") as handle:
+                text = handle.read().decode("utf-8")
         except (OSError, UnicodeError) as exc:
             print(f"error: cannot read export: {exc}", file=sys.stderr)
             return 2
@@ -525,12 +556,6 @@ def main(argv: list[str] | None = None) -> int:
         except AdapterError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-        # The payload lands in a fresh owner-only file that atomically
-        # replaces the destination name: truncating an existing
-        # destination in place would follow a hard-linked alias's shared
-        # inode, and an alias never receives the payload. Both steps go
-        # through the pinned directory descriptor the path guard
-        # verified, so a parent swapped mid-run cannot redirect them.
         out_name = Path(args.output).name
         staging_name = out_name + ".tmp"
         try:

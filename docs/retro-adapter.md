@@ -42,7 +42,10 @@ pathname given and its symlink-resolved target), as is output onto the
 export itself (symlink and hard-link aliases included). The export is
 likewise refused as a source when it lies inside a public checkout; it
 is not required to sit inside an ephemeris root, because ephemeris
-delivers exports as browser downloads. The payload is written to a
+delivers exports as browser downloads. The export is opened once,
+validated as the opened file, and read through that same descriptor —
+a source retargeted between check and read cannot substitute a
+different file. The payload is written to a
 fresh owner-only (`0600`) staging file (`<output>.tmp`) that atomically
 replaces the destination name — an existing destination's inode is
 never truncated in place, so a hard-linked alias of it never receives
