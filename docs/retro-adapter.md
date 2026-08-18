@@ -1,12 +1,15 @@
-# Ephemeris retro → Exp2Res §19.1 adapter
+# Ephemeris retro/diary → Exp2Res §19.1 adapter
 
 `scripts/retro_adapter.py` reads an ephemeris JSONL audit export, selects
-the retro-entry slice, and emits the §19.1 activity-domain JSONL payload
-that `exp2res import ephemeris <file>` accepts
+the retro-entry and diary-entry slices, and emits the §19.1
+activity-domain JSONL payload that `exp2res import ephemeris <file>`
+accepts
 ([selfos#37](https://github.com/jointsome0-lgtm/selfos/issues/37), under
 the [#25](https://github.com/jointsome0-lgtm/selfos/issues/25)
-integration architecture). Source contract: ephemeris `docs/retro-spec.md`
-(sec33). Target contract: exp2res `spec/19-integration-contracts.md`
+integration architecture). Source contracts: ephemeris
+`docs/retro-spec.md` (sec33) and `docs/diary-spec.md` (sec35). Routing
+contract for the diary slice: [tags.md](tags.md) (route/deny table v1).
+Target contract: exp2res `spec/19-integration-contracts.md`
 §19.1 body, §19.4 envelope semantics.
 
 ```
@@ -63,17 +66,19 @@ receiving workspace.
 
 ## Selection
 
-Export lines are grouped by `payload.retro_uuid`; the latest
-`retro_entry_*` event in file order wins (the export is ordered by ledger
-append order); an entry whose latest snapshot has `archived_at` set is
-excluded (`skipped: archived`). An identity carrying any event with an
-unsupported `payload_version` is rejected whole — its latest state is
-unreadable, so an older snapshot never stands in for it. Any other event
-type is ignored and counted — this event-type filter is the seam where diary events
-(ephemeris#2) would be admitted later, and nothing else is built for
-them. A knowledge-state payload is never this slice: it is not a
-`retro_entry_*` event, so it never passes the filter, and no
-Atlas-shaped record is ever emitted.
+Export lines are grouped per slice — `retro_entry_*` events by
+`payload.retro_uuid`, `diary_entry_*` events by `payload.diary_uuid`;
+the slices never mix, and a mixed export yields both in one pass (every
+retro record first, then every diary record, each slice in first-seen
+export order). The latest event in file order wins (the export is
+ordered by ledger append order); an entry whose latest snapshot has
+`archived_at` set is excluded (`skipped: archived`). An identity
+carrying any event with an unsupported `payload_version` is rejected
+whole — its latest state is unreadable, so an older snapshot never
+stands in for it. Any other event type is ignored and counted. A
+knowledge-state payload is never either slice: it is not a
+`retro_entry_*` or `diary_entry_*` event, so it never passes the
+filter, and no Atlas-shaped record is ever emitted.
 
 ## Mapping table
 
@@ -128,24 +133,92 @@ never per edit.
   equals the exp2res `source_record_id` metadata, and removing
   already-delivered evidence is the owner's exp2res deletion flow.
 
+## Diary slice
+
+The diary slice routes under the [tags.md](tags.md) route/deny table
+v1: every non-private entry ships to the exp2res raw-log route by
+default; `private` is the absolute deny tier. The adapter is the
+primary privacy gate — the ephemeris export is a full ledger replay,
+private entries included (diary-spec sec3).
+
+### Privacy deny, history-wide
+
+An entry whose **any** event snapshot carries `private: true` is denied
+— not just the latest. The tags.md latch is one-way (once private,
+never shipped), and clearing the flag on an existing entry has no
+routing effect, so a history that was ever private never ships. The
+latch is read on every diary event, an unsupported `payload_version`
+included, because denying is always the safe direction; `private` wins
+over every other disposition (archived, unsupported version) in the
+report. Denied entries appear in the run report content-free: counts
+plus `diary_uuid` only, reason `private` — no `record_id` is minted for
+an entry that must never become a record. A valid diary event whose
+`private` value is not a JSON boolean marks the identity's privacy
+state unreadable, and an entry whose privacy cannot be read is never
+shipped (`rejected: invalid_snapshot`).
+
+Late-privatization *delivery* — the content-free flag-flip to a copy
+already shipped non-private (tags.md "Late privatization", exp2res#28
+second line) — is out of scope for this slice. The seam is the denied
+report entries: they carry the `diary_uuid` whose exp2res
+`source_record_id` would be `ephemeris:diary:<diary_uuid>`, so the
+owner can cross-check a previously delivered copy; the stateless
+adapter (no-copy rule) cannot know what was delivered.
+
+### Mapping table
+
+| Source (diary snapshot) | Target (§19.1) | Rule |
+|---|---|---|
+| — | `source` | literal `ephemeris` |
+| `diary_uuid` | `record_id` | `ephemeris:diary:<diary_uuid>` — minted once per entry, never per edit (same rule as retro) |
+| — | `domain` | literal `activity` |
+| `entry_date` | `occurred` | resolved by the same imported `exp2res.services.time_input.parse_occurred` in `--timezone`, at `exact_day` precision, `high` confidence — day precision, no invention. The confidence constant is the value exp2res's own day-capture path (`today_occurred`) assigns to an owner-picked exact day; the diary UI makes `entry_date` a deliberate owner choice (default today, never future). A value that is not the sec35 `YYYY-MM-DD` wire shape is `rejected: invalid_snapshot`; a well-shaped date the grammar refuses (an impossible calendar day) is `rejected: entry_date_unparsable:<code>` — never approximated. |
+| — | `project` | literal `diary`. §19.1 requires a non-empty project; diary entries carry none, and adapters never interpret free text or inert tags to guess one — a single slice-level provenance label is a routing fact, not per-record invention. The owner ratifies this constant (and the confidence constant above) at PR review. |
+| `text` | `text` | verbatim source voice; data only, never interpreted |
+| `private` | — | routing only: the history-wide deny latch above; never emitted |
+| `tags` | — | never read. §19.1 has no tags field; `atlas` routes to the atlas intake, not this slice; `career` is reserved-inert (tags.md v1); personal tags are inert by contract |
+| `atlas_ref` | — | belongs to the atlas route's intake; never read here |
+| `created_at`, `updated_at`, `archived_at` | — | capture/lifecycle provenance; a capture timestamp never populates `occurred` (§19.1). `archived_at` only drives the archived exclusion |
+| `diary_id` | — | ephemeris-local row id; the stable identity is `diary_uuid` |
+
+Identity and edit semantics are exactly the retro rules: edits before
+first import converge adapter-side (latest event wins); edits after a
+delivered import arrive as the same identity with a different content
+hash and exp2res rejects them by §19.4 rule 2 — the owner's §14.4
+correction flow is the only reinterpretation channel; rerunning adapter
++ import over an unchanged export converges (byte-identical output,
+§19.4 `duplicate` no-ops); archival after delivery does not propagate
+and is surfaced, not hidden.
+
+Like the ratified retro slice, this slice builds no delivery-receipt
+store: idempotency rests on §19.4 duplicate convergence. The tags.md
+receipts ledger remains the standing gap, named in the delivering PR.
+
 ## Report reason codes
+
+Report entries carry the slice's own uuid key (`retro_uuid` or
+`diary_uuid`) plus `record_id` — except `denied` entries, which carry
+`diary_uuid` only.
 
 | Class | Reason | Meaning |
 |---|---|---|
+| denied | `private` | some event snapshot of this diary identity carries `private: true`; the history-wide latch denies the entry (tags.md) |
 | skipped | `archived` | latest snapshot is archived |
-| skipped | `no_project` | the entry has no project (`null` or blank) and §19.1 requires one |
+| skipped | `no_project` | the retro entry has no project (`null` or blank) and §19.1 requires one (diary entries always carry the constant `diary`) |
 | rejected | `period_unparsable:<code>` | exp2res grammar refused `period_raw` (grammar drift) |
-| rejected | `invalid_snapshot` | snapshot field types are not the sec33 wire shape (a non-string `project` included), or the latest event's archive transition contradicts its own snapshot (`retro_entry_archived` without `archived_at`, `retro_entry_unarchived` with it) |
+| rejected | `entry_date_unparsable:<code>` | exp2res grammar refused a well-shaped `entry_date` (an impossible calendar day) |
+| rejected | `invalid_snapshot` | snapshot field types are not the sec33/sec35 wire shape (a non-string `project`, a non-`YYYY-MM-DD` `entry_date`, or a non-boolean `private` — an unreadable privacy state never ships), or the latest event's archive transition contradicts its own snapshot (`*_archived` without `archived_at`, `*_unarchived` with it) |
 | rejected | `text_not_encodable` | the record cannot be encoded as UTF-8 (e.g. an unpaired surrogate in a corrupted export) |
 | rejected | `unsupported_payload_version` | some event of this identity carries a `payload_version` that is not exactly the integer `1`; the whole entry is rejected |
 
 Three conditions refuse the whole run rather than a single record, each
-named with its physical line number: a retro event whose payload
-carries no attributable `retro_uuid`, any line that is not a JSON event
-object at all, and any unknown `retro_entry_*` event type (a newer
-retro contract than this adapter speaks). All share one reason — the
-unreadable or unrecognized event could change or hide the state of any
-entry, and an earlier snapshot must never stand in for it.
+named with its physical line number: a retro or diary event whose
+payload carries no attributable `retro_uuid`/`diary_uuid`, any line
+that is not a JSON event object at all, and any unknown `retro_entry_*`
+or `diary_entry_*` event type (a newer contract than this adapter
+speaks). All share one reason — the unreadable or unrecognized event
+could change or hide the state of any entry, and an earlier snapshot
+must never stand in for it.
 
 Deterministic only: no model call, no network, no persistent state, and
 entry text cannot alter behaviour. Requires the `exp2res` package to be

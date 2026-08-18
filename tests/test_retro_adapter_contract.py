@@ -35,6 +35,7 @@ def test_accepted_record_matches_the_191_shape_and_grammar():
         "accepted": 1,
         "skipped": 0,
         "rejected": 0,
+        "denied": 0,
         "ignored_lines": 0,
     }
     expected = parse_occurred(
