@@ -13,7 +13,7 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts import doctor  # noqa: E402
+from scripts import doctor, retro_adapter  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -24,6 +24,7 @@ def isolated_doctor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setattr(doctor, "ROOT", public_root)
     monkeypatch.setattr(doctor, "PINS_PATH", public_root / "pins.toml")
     monkeypatch.setattr(doctor, "CONFIG_PATH", tmp_path / "config.toml")
+    monkeypatch.setattr(retro_adapter, "CONFIG_PATH", tmp_path / "config.toml")
     for variable in (*doctor.ENV_VARS.values(), "ACTIVITY_DB"):
         monkeypatch.delenv(variable, raising=False)
     monkeypatch.setattr(doctor, "_safe_runner_path", lambda _roots: ("", {}))
