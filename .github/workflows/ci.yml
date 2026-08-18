@@ -21,5 +21,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install -r tests/requirements.txt
+      - id: pins
+        run: |
+          echo "exp2res=$(python -c 'import tomllib; print(tomllib.load(open("pins.toml", "rb"))["exp2res"])')" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: jointsome0-lgtm/exp2res
+          ref: ${{ steps.pins.outputs.exp2res }}
+          path: .exp2res-pin
+      - run: python -m pip install -r tests/requirements.txt ./.exp2res-pin
       - run: python -m pytest tests -q
